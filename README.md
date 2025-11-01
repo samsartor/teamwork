@@ -3,7 +3,7 @@
 The official implementation of "Teamwork: Collaborative Diffusion with Low-rank Coordination and Adaptation".
 
 **Currently only a minimal implementation is provided. The full implementation will be
-released before November 1st!**
+released before SIGGRAPH Asia 2025**
 
 ## Abstract
 
