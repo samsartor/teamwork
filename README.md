@@ -1,6 +1,6 @@
 <h1 align="center">Teamwork</h1>
 <p align="center">
-<a href="https://bin.samsartor.com/teamwork.pdf">📃 Paper</a> | <a href="https://samsartor.com/teamwork">🌐 Website</a> | <a href="https://bin.samsartor.com/teamwork_supplemental.pdf">🖼️ Supplemental</a>
+<a href="https://bin.samsartor.com/teamwork.pdf">📃 Paper</a> | <a href="https://samsartor.com/teamwork">🌐 Website</a> | <a href="https://bin.samsartor.com/teamwork_supplemental.pdf">🖼️ Supplemental</a> | <a href="https://huggingface.co/samsartor/teamwork-release">🤗 Models</a>
 </p>
 <p align="center"><img width="700px" src="https://samsartor.com/teamwork_teaser.svg" /></p>
 
