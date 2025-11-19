@@ -2,7 +2,7 @@
 <p align="center">
 <a href="https://bin.samsartor.com/teamwork.pdf">📃 Paper</a> | <a href="https://samsartor.com/teamwork">🌐 Website</a> | <a href="https://bin.samsartor.com/teamwork_supplemental.pdf">🖼️ Supplemental</a> | <a href="https://huggingface.co/samsartor/teamwork-release">🤗 Models</a>
 </p>
-<p align="center"><img width="700px" src="https://samsartor.com/teamwork_teaser.svg" /></p>
+<p align="center"><img width="700px" src="https://raw.githubusercontent.com/samsartor/teamwork/refs/heads/main/demo/teaser.png" /></p>
 
 The official implementation of "Teamwork: Collaborative Diffusion with Low-rank Coordination and Adaptation".
 
