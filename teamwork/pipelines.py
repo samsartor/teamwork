@@ -12,9 +12,11 @@ from .batch import BatchBuilder, Selection
 
 @dataclass
 class LossOutput:
+    latents: Tensor
     prediction: Tensor
     target: Tensor
     weight: Tensor
+    timestep_idx: Tensor
     type: str
 
     @property

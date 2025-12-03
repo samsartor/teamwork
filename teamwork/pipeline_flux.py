@@ -110,17 +110,17 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
 
         with torch.no_grad():
             if self.timestep_weight == "unit" or self.timestep_weight == "sigma_sqrt":
-                timestep_u = torch.rand([])
+                timestep_u = torch.rand([batch.batch_size])
             elif self.timestep_weight == "logit_normal":
-                timestep_u = torch.nn.functional.sigmoid(torch.randn([]))
+                timestep_u = torch.nn.functional.sigmoid(torch.randn([batch.batch_size]))
             else:
                 raise ValueError(f"Unknown timestep weight {self.timestep_weight}")
 
+            sel = batch.selection()
             timestep_i = (timestep_u * len(self.scheduler.timesteps)).long()
             timesteps = (
-                self.scheduler.timesteps[timestep_i]
+                self.scheduler.timesteps[timestep_i][sel.batch_indices]
                 .to(device=self.device, dtype=self.dtype)
-                .repeat(batch.count)
             )
 
             # Guidance is only supported on some Flux models
@@ -133,7 +133,6 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
                 guidance = None
 
             # Figure out how much noise to add to the latents
-            sel = batch.selection()
             latents = batch.packed_encoded_images(
                 self.vae_encode, self.in_channels, 1 / self.vae_scale_factor
             )
@@ -227,9 +226,11 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
         latents_pred = model_pred * (-sigmas) + noisy_latents
 
         return LossOutput(
+            latents=latents,
             prediction=latents_pred[sel.output_subindices],
             target=latents[sel.output_subindices],
             weight=batch.packed_scaled_weights(1 / self.vae_scale_factor)[sel.output_subindices].unsqueeze(1) * weighting,
+            timestep_idx=timestep_i,
             type='signal',
         )
 

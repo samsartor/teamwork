@@ -93,6 +93,8 @@ class StableDiffusionXLTeamworkPipeline(TeamworkPipeline, StableDiffusionXLPipel
         prompt: str = "",
     ) -> LossOutput:
         with torch.no_grad():
+            sel = batch.selection()
+
             # Sample a random timestep for each image
             train_scheduler = DDPMScheduler.from_config(self.scheduler.config)
             assert isinstance(train_scheduler, DDPMScheduler)
@@ -100,13 +102,12 @@ class StableDiffusionXLTeamworkPipeline(TeamworkPipeline, StableDiffusionXLPipel
             timesteps: Any = torch.randint(
                 0,
                 scheduler_config.num_train_timesteps,
-                [1],
+                [batch.batch_size],
                 device=self.device,
                 dtype=torch.long,
-            ).repeat(batch.count)
+            )[sel.batch_indices]
 
             # Add noise to the latents according to the noise magnitude at each timestep
-            sel = batch.selection()
             latents = batch.packed_encoded_images(
                 self.vae_encode,
                 self.unet.config["in_channels"],
@@ -175,9 +176,11 @@ class StableDiffusionXLTeamworkPipeline(TeamworkPipeline, StableDiffusionXLPipel
         ).sample
 
         return LossOutput(
+            latents=latents,
             prediction=model_pred.float()[sel.output_subindices],
             target=target.float()[sel.output_subindices],
             weight=batch.packed_scaled_weights(1 / self.vae_scale_factor)[sel.output_subindices].unsqueeze(1),
+            timestep_idx=timesteps,
             type=pred_type,
         )
 

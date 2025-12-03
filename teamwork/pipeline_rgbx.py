@@ -118,11 +118,11 @@ class StableDiffusionRGB2XPipeline(TeamworkPipeline, StableDiffusionPipeline):
         noise: torch.Tensor,
         model: Any | None = None,
         prompt: str = "",
-    ) -> Tensor:
+    ) :
         with torch.no_grad():
             # Split into control signal and outputs
             ibatch, obatch = batch.split_io()
-            assert ibatch.count == 1, (
+            assert ibatch.count == obatch.batch_size, (
                 "this rgb2x implementation only supports a single input"
             )
             control_img = ibatch.packed_encoded_images(
@@ -135,10 +135,10 @@ class StableDiffusionRGB2XPipeline(TeamworkPipeline, StableDiffusionPipeline):
             timesteps: Any = torch.randint(
                 0,
                 scheduler_config.num_train_timesteps,
-                [1],
+                [obatch.batch_size],
                 device=self.device,
                 dtype=torch.long,
-            ).repeat(obatch.count)
+            )
 
             # Add noise to the latents according to the noise magnitude at each timestep
             sel = obatch.selection()
@@ -195,9 +195,11 @@ class StableDiffusionRGB2XPipeline(TeamworkPipeline, StableDiffusionPipeline):
         ).sample
 
         return LossOutput(
+            latents=latents,
             prediction=model_pred.float()[sel.output_subindices],
             target=target.float()[sel.output_subindices],
             weight=batch.packed_scaled_weights(1 / self.vae_scale_factor)[sel.output_subindices].unsqueeze(1),
+            timestep_idx=timesteps,
             type=pred_type,
         )
 

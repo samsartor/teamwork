@@ -142,16 +142,17 @@ class StableDiffusion3RGB2XPipeline(TeamworkPipeline, StableDiffusion3Pipeline):
         assert self.scheduler.sigmas is not None
 
         with torch.no_grad():
+            ibatch, obatch = batch.split_io()
+            
             if self.timestep_weight == "unit" or self.timestep_weight == "sigma_sqrt":
-                timestep_u = torch.rand([])
+                timestep_u = torch.rand([obatch.batch_size])
             elif self.timestep_weight == "logit_normal":
-                timestep_u = torch.nn.functional.sigmoid(torch.randn([]))
+                timestep_u = torch.nn.functional.sigmoid(torch.randn([obatch.batch_size]))
             else:
                 raise ValueError(f"Unknown timestep weight {self.timestep_weight}")
 
             # Split into control signal and outputs
-            ibatch, obatch = batch.split_io()
-            assert ibatch.count == 1, (
+            assert ibatch.count == obatch.batch_size, (
                 "this rgb2x implementation only supports a single input"
             )
             control_img = ibatch.packed_encoded_images(
@@ -227,9 +228,11 @@ class StableDiffusion3RGB2XPipeline(TeamworkPipeline, StableDiffusion3Pipeline):
         latents_pred = model_pred * (-sigmas) + noisy_latents
 
         return LossOutput(
+            latents=latents,
             prediction=latents_pred[sel.output_subindices],
             target=latents[sel.output_subindices],
             weight=batch.packed_scaled_weights(1 / self.vae_scale_factor)[sel.output_subindices].unsqueeze(1) * weighting,
+            timestep_idx=timestep_i,
             type='signal',
         )
 
