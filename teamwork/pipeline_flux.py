@@ -227,10 +227,11 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
         latents_pred = model_pred * (-sigmas) + noisy_latents
 
         return LossOutput(
+            selection=sel,
             latents=latents,
-            prediction=latents_pred[sel.output_subindices],
-            target=latents[sel.output_subindices],
-            weight=batch.packed_scaled_weights(1 / self.vae_scale_factor)[sel.output_subindices].unsqueeze(1) * weighting,
+            prediction=latents_pred,
+            target=latents,
+            weight=batch.packed_scaled_weights(1 / self.vae_scale_factor).unsqueeze(1) * weighting,
             timestep_idx=timestep_i,
             type='signal',
         )

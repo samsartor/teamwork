@@ -12,6 +12,7 @@ from .batch import BatchBuilder, Selection
 
 @dataclass
 class LossOutput:
+    selection: Selection
     latents: Tensor
     prediction: Tensor
     target: Tensor
@@ -22,10 +23,10 @@ class LossOutput:
     @property
     def loss(self):
         return (F.mse_loss(
-            self.prediction,
-            self.target,
+            self.prediction[self.selection.output_subindices],
+            self.target[self.selection.output_subindices],
             reduction="none",
-        ) * self.weight).mean()
+        ) * self.weight[self.selection.output_subindices]).mean()
 
 
 class TeamworkPipeline(ABC):
