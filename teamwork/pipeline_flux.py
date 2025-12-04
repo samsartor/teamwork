@@ -117,9 +117,10 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
                 raise ValueError(f"Unknown timestep weight {self.timestep_weight}")
 
             sel = batch.selection()
+            timestep_u = timestep_u[sel.batch_indices]
             timestep_i = (timestep_u * len(self.scheduler.timesteps)).long()
             timesteps = (
-                self.scheduler.timesteps[timestep_i][sel.batch_indices]
+                self.scheduler.timesteps[timestep_i]
                 .to(device=self.device, dtype=self.dtype)
             )
 
