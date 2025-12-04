@@ -137,7 +137,7 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
             latents = batch.packed_encoded_images(
                 self.vae_encode, self.in_channels, 1 / self.vae_scale_factor
             )
-            sigmas = self.scheduler.sigmas[timestep_i].to(
+            sigmas = self.scheduler.sigmas[timestep_i].reshape(batch.count, 1, 1, 1).to(
                 dtype=self.dtype, device=self.device
             )
             noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
