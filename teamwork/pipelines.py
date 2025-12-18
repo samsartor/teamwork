@@ -2,7 +2,7 @@ from pathlib import Path
 import torch
 from torch import Tensor
 import torch.nn.functional as F
-from typing import Self, Any, Literal
+from typing import Any, Literal
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
@@ -76,7 +76,7 @@ class TeamworkPipeline(ABC):
         override_profile: list[Adapt] | None = None,
         state: dict[str, torch.Tensor] | None = None,
         training: bool = False,
-    ) -> Self:
+    ) -> "TeamworkPipeline":
         """
         Create a teamwork pipeline from a base diffusers pipeline, reusing as much of the base pipeline
         as possible without altering it. This is the starting point for training your own teamwork model.

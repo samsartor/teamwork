@@ -12,7 +12,7 @@ from collections import OrderedDict
 import torch
 import safetensors.torch
 from torch import nn
-from typing import Optional, Tuple, Any, TypeAlias
+from typing import Optional, Tuple, Any, TypeAlias, TypeVar, Generic
 from pathlib import Path
 import re
 from copy import copy
@@ -21,8 +21,10 @@ from collections import defaultdict
 from .config import TeamworkConfig, config_to_metadata, metadata_to_config
 from .batch import Selection
 
+Params = TypeVar('Params')
 
-class AdapterMixin[Params]:
+
+class AdapterMixin(Generic[Params]):
     """
     Implemented by adapted layers. See TeamworkLinear in linear.py
 
