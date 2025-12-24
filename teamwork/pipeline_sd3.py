@@ -200,6 +200,7 @@ class StableDiffusion3TeamworkPipeline(TeamworkPipeline, StableDiffusion3Pipelin
         num_inference_steps: int = 50,
         guidance_scale: float = 1.0,
         noise: Tensor | None = None,
+        generator: torch.Generator | None = None,
         height: int | None = None,
         width: int | None = None,
         output_type: OutputImageType = "pil",
@@ -225,7 +226,12 @@ class StableDiffusion3TeamworkPipeline(TeamworkPipeline, StableDiffusion3Pipelin
             1 / self.vae_scale_factor,
         )
         if noise is None:
-            latents = torch.randn(clean_latents.shape, device=device, dtype=self.dtype)
+            latents = torch.randn(
+                clean_latents.shape,
+                device=device,
+                dtype=self.dtype,
+                generator=generator,
+            )
         else:
             latents = noise.to(device, self.dtype)
 
