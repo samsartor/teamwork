@@ -130,7 +130,7 @@ class StableDiffusion2TeamworkPipeline(TeamworkPipeline, StableDiffusionPipeline
                 (prompt_embeds, _) = self.encode_prompt(
                     prompt,
                     device=self.device,
-                    num_images_per_prompt=latents.shape[0],
+                    num_images_per_prompt=latents.shape[0] if isinstance(prompt, str) else 1,
                     do_classifier_free_guidance=False,
                 )
 
@@ -154,10 +154,11 @@ class StableDiffusion2TeamworkPipeline(TeamworkPipeline, StableDiffusionPipeline
         ).sample
 
         return LossOutput(
+            selection=sel,
             latents=latents,
-            prediction=model_pred.float()[sel.output_subindices],
-            target=target.float()[sel.output_subindices],
-            weight=batch.packed_scaled_weights(1 / self.vae_scale_factor)[sel.output_subindices].unsqueeze(1),
+            prediction=model_pred.float(),
+            target=target.float(),
+            weight=batch.packed_scaled_weights(1 / self.vae_scale_factor).unsqueeze(1),
             timestep_idx=timesteps,
             type=pred_type,
         )
