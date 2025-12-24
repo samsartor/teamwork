@@ -245,6 +245,7 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
         num_inference_steps: int = 50,
         guidance_scale: float = 3.5,
         noise: Tensor | None = None,
+        generator: torch.Generator | None = None,
         height: int | None = None,
         width: int | None = None,
         output_type: OutputImageType = "pil",
@@ -268,7 +269,12 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
             self.vae_encode, self.in_channels, 1 / self.vae_scale_factor
         )
         if noise is None:
-            latents = torch.randn(clean_latents.shape, device=device, dtype=self.dtype)
+            latents = torch.randn(
+                clean_latents.shape,
+                device=device,
+                dtype=self.dtype,
+                generator=generator,
+            )
         else:
             latents = noise.to(device, self.dtype)
 
