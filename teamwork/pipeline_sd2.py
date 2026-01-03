@@ -85,6 +85,7 @@ class StableDiffusion2TeamworkPipeline(TeamworkPipeline, StableDiffusionPipeline
         batch: BatchBuilder,
         noise: torch.Tensor,
         model: Any | None = None,
+        timesteps: Tensor | None = None,
         prompt: str = "",
     ) -> LossOutput:
         with torch.no_grad():
@@ -94,13 +95,16 @@ class StableDiffusion2TeamworkPipeline(TeamworkPipeline, StableDiffusionPipeline
             train_scheduler = DDPMScheduler.from_config(self.scheduler.config)
             assert isinstance(train_scheduler, DDPMScheduler)
             scheduler_config: Any = train_scheduler.config
-            timesteps: Any = torch.randint(
-                0,
-                scheduler_config.num_train_timesteps,
-                [batch.batch_size],
-                device=self.device,
-                dtype=torch.long,
-            )[sel.batch_indices]
+            if timesteps is None:
+                timesteps: Any = torch.randint(
+                    0,
+                    scheduler_config.num_train_timesteps,
+                    [batch.batch_size],
+                    device=self.device,
+                    dtype=torch.long,
+                )[sel.batch_indices]
+            else:
+                timesteps = timesteps[sel.batch_indices]
 
             # Add noise to the latents according to the noise magnitude at each timestep
             latents = batch.packed_encoded_images(

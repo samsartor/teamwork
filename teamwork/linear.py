@@ -155,10 +155,10 @@ try:
             assert self.selection is not None
             return torch.index_select(x, 0, self.selection.teammate_indices)
 
-        def forward(self, inputs: Tensor) -> Tensor:
-            output = super().forward(inputs)
+        def forward(self, input: Tensor) -> Tensor:
+            output = super().forward(input)
             output_dtype = output.dtype
-            inputs = inputs.to(self.adapter.down.dtype)
+            input = input.to(self.adapter.down.dtype)
             output = output.to(self.adapter.down.dtype)
 
             if self.communicate:
