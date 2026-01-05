@@ -45,7 +45,7 @@ class StableDiffusion2TeamworkPipeline(TeamworkPipeline, StableDiffusionPipeline
 
     @property
     def unwrapped_unet(self):
-        model = self.transformer
+        model = self.unet
         while hasattr(model, 'module'):
             model = getattr(model, 'module')
         return model
