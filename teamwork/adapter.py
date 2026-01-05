@@ -259,6 +259,9 @@ def adapter_modules(module: nn.Module) -> OrderedDict[str, AdapterMixin]:
         (k, m) for (k, m) in module.named_modules() if isinstance(m, AdapterMixin)
     )
 
+def disable_adapters(module: nn.Module):
+    for adapter in adapter_modules(module).values():
+        adapter.selection = None
 
 def adapter_parameters(module: nn.Module) -> OrderedDict[str, nn.Parameter]:
     return OrderedDict(

@@ -53,11 +53,18 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
         return pipeline
 
     @property
+    def unwrapped_transformer(self):
+        model = self.transformer
+        while hasattr(model, 'module'):
+            model = getattr(model, 'module')
+        return model
+
+    @property
     def in_channels(self) -> int:
-        return self.transformer.config["in_channels"] // 4
+        return self.unwrapped_transformer.config["in_channels"] // 4
 
     def save_adapters(self, safetensors_path: str):
-        save_adapters(self.transformer, safetensors_path, self.teamwork_config)
+        save_adapters(self.unwrapped_transformer, safetensors_path, self.teamwork_config)
 
     def load_extra_metadata(self, metadata: dict[str, str]):
         pass
@@ -101,7 +108,6 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
         self,
         batch: BatchBuilder,
         noise: torch.Tensor,
-        model: Any | None = None,
         prompt: str | list[str] = "",
     ) -> LossOutput:
         assert isinstance(self.scheduler, FlowMatchEulerDiscreteScheduler)
@@ -126,7 +132,7 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
 
             # Guidance is only supported on some Flux models
             if isinstance(
-                self.transformer.time_text_embed,
+                self.unwrapped_transformer.time_text_embed,
                 CombinedTimestepGuidanceTextProjEmbeddings,
             ):
                 guidance = torch.full_like(timesteps, 3.5)
@@ -188,7 +194,7 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
             model_latents = torch.cat([noisy_latents, extra], dim=1)
 
         # Update selection
-        for adapter in adapter_modules(self.transformer).values():
+        for adapter in adapter_modules(self.unwrapped_transformer).values():
             adapter.selection = sel
 
         # Account for extra channels in the rearrange
@@ -203,9 +209,7 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
             ph=2,
             pw=2,
         )
-        if model is None:
-            model = self.transformer
-        model_pred = model(
+        model_pred = self.transformer(
             hidden_states=model_input,
             timestep=timesteps / 1000,
             guidance=guidance,
@@ -344,7 +348,7 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
 
                 # Guidance is only supported on some Flux models
                 if isinstance(
-                    self.transformer.time_text_embed,
+                    self.unwrapped_transformer.time_text_embed,
                     CombinedTimestepGuidanceTextProjEmbeddings,
                 ):
                     guidance = torch.full_like(timestep, guidance_scale)

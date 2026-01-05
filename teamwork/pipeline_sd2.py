@@ -44,11 +44,18 @@ class StableDiffusion2TeamworkPipeline(TeamworkPipeline, StableDiffusionPipeline
         return pipeline
 
     @property
+    def unwrapped_unet(self):
+        model = self.transformer
+        while hasattr(model, 'module'):
+            model = getattr(model, 'module')
+        return model
+    
+    @property
     def in_channels(self) -> int:
-        return self.unet.config["in_channels"]
+        return self.unwrapped_unet.config["in_channels"]
 
     def save_adapters(self, safetensors_path: str):
-        save_adapters(self.unet, safetensors_path, self.teamwork_config)
+        save_adapters(self.unwrapped_unet, safetensors_path, self.teamwork_config)
 
     def load_extra_metadata(self, metadata: dict[str, str]):
         pass
@@ -84,7 +91,6 @@ class StableDiffusion2TeamworkPipeline(TeamworkPipeline, StableDiffusionPipeline
         self,
         batch: BatchBuilder,
         noise: torch.Tensor,
-        model: Any | None = None,
         timesteps: Tensor | None = None,
         prompt: str = "",
     ) -> LossOutput:
@@ -109,7 +115,7 @@ class StableDiffusion2TeamworkPipeline(TeamworkPipeline, StableDiffusionPipeline
             # Add noise to the latents according to the noise magnitude at each timestep
             latents = batch.packed_encoded_images(
                 self.vae_encode,
-                self.unet.config["in_channels"],
+                self.unwrapped_unet.config["in_channels"],
                 1 / self.vae_scale_factor,
             )
             noisy_latents = train_scheduler.add_noise(latents, noise, timesteps)
@@ -145,13 +151,11 @@ class StableDiffusion2TeamworkPipeline(TeamworkPipeline, StableDiffusionPipeline
             model_input = torch.cat([noisy_latents, extra], dim=1)
 
         # Update selection
-        for adapter in adapter_modules(self.unet).values():
+        for adapter in adapter_modules(self.unwrapped_unet).values():
             adapter.selection = sel
 
         # Predict the noise residual
-        if model is None:
-            model = self.unet
-        model_pred = model(
+        model_pred = self.unet(
             sample=model_input,
             timestep=timesteps,
             encoder_hidden_states=prompt_embeds,
@@ -202,7 +206,7 @@ class StableDiffusion2TeamworkPipeline(TeamworkPipeline, StableDiffusionPipeline
         # Initialize latents
         sel = batch.selection()
         clean_latents = batch.packed_encoded_images(
-            self.vae_encode, self.unet.config["in_channels"], 1 / self.vae_scale_factor
+            self.vae_encode, self.unwrapped_unet.config["in_channels"], 1 / self.vae_scale_factor
         )
         if noise is None:
             latents = torch.randn(
@@ -239,7 +243,7 @@ class StableDiffusion2TeamworkPipeline(TeamworkPipeline, StableDiffusionPipeline
         extra = batch.packed_scaled_extra(1 / self.vae_scale_factor)
 
         # Update selection
-        for adapter in adapter_modules(self.unet).values():
+        for adapter in adapter_modules(self.unwrapped_unet).values():
             adapter.selection = sel
 
         # Denoising loop

@@ -9,6 +9,7 @@ import PIL.Image
 
 @dataclass(frozen=True)
 class Selection:
+    enabled: bool
     teammate_indices: Tensor # (components,): int
     input_subindices: Tensor  # (input_components,): int
     output_subindices: Tensor  # (output_components,): int
@@ -422,6 +423,7 @@ class BatchBuilder:
             batch_matrix[i, component.batch_idx] = True
 
         return Selection(
+            enabled=True,
             teammate_indices=torch.tensor(
                 teammate_indices, dtype=torch.int64, device=self.device
             ),

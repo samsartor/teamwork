@@ -43,6 +43,8 @@ class TeamworkLinear(nn.Linear, AdapterMixin[LoraParameters]):
 
     def forward(self, input: Tensor) -> Tensor:
         output = super().forward(input)
+        if self.selection is None:
+            return output
         output_dtype = output.dtype
         input = input.to(self.adapter.down.dtype)
         output = output.to(self.adapter.down.dtype)
@@ -100,6 +102,8 @@ class TeamworkConv2d(nn.Conv2d, AdapterMixin[LoraParameters]):
 
     def forward(self, input: Tensor) -> Tensor:
         output = super().forward(input)
+        if self.selection is None:
+            return output
         output_dtype = output.dtype
         input = input.to(self.adapter.down.dtype)
         output = output.to(self.adapter.down.dtype)
@@ -157,6 +161,8 @@ try:
 
         def forward(self, input: Tensor) -> Tensor:
             output = super().forward(input)
+            if self.selection is None:
+                return output
             output_dtype = output.dtype
             input = input.to(self.adapter.down.dtype)
             output = output.to(self.adapter.down.dtype)
