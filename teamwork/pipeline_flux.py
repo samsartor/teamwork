@@ -36,6 +36,7 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
         override_profile: list[Adapt] | None = None,
         state: dict[str, torch.Tensor] | None = None,
         training: bool = False,
+        grad_checkpointing: bool = True,
     ):
         pipeline = cls(**base_pipeline.components)  # type: ignore
         pipeline.teamwork_config = teamwork_config
@@ -48,7 +49,7 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
             override_profile=override_profile,
             state=state,
         )
-        if training:
+        if training and grad_checkpointing:
             pipeline.transformer.enable_gradient_checkpointing()
         return pipeline
 

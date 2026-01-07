@@ -27,6 +27,7 @@ class StableDiffusion2TeamworkPipeline(TeamworkPipeline, StableDiffusionPipeline
         override_profile: list[Adapt] | None = None,
         state: dict[str, torch.Tensor] | None = None,
         training: bool = False,
+        grad_checkpointing: bool = True,
     ):
         pipeline = cls(**base_pipeline.components)  # type: ignore
         pipeline.teamwork_config = teamwork_config
@@ -39,7 +40,7 @@ class StableDiffusion2TeamworkPipeline(TeamworkPipeline, StableDiffusionPipeline
             override_profile=override_profile,
             state=state,
         )
-        if training:
+        if training and grad_checkpointing:
             pipeline.unet.enable_gradient_checkpointing()
         return pipeline
 
