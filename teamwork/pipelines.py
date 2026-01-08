@@ -39,6 +39,7 @@ class TeamworkPipeline(ABC):
         filename: str | None = None,
         base_pipeline: Any | None = None,
         training: bool = False,
+        grad_checkpointing: bool = True,
         **kwargs,
     ):
         """
@@ -120,7 +121,7 @@ class TeamworkPipeline(ABC):
         self,
         batch: BatchBuilder,
         noise: Tensor,
-        model: Any | None = None,
+        prompt: str | list[str] = "",
     ) -> LossOutput:
         """
         Compute the diffusion loss on the given batch.
@@ -194,7 +195,10 @@ def automatic_pipeline(base: Any, config: TeamworkConfig) -> type[TeamworkPipeli
         from .pipeline_sdxl import StableDiffusionXLTeamworkPipeline
 
         return StableDiffusionXLTeamworkPipeline
-    if base_type.__name__ == "FluxPipeline":
+    if base_type.__name__ in ["FluxPipeline", "FluxKontextPipeline"]:
+        from .pipeline_flux import FluxTeamworkPipeline
+
+    if base_type.__name__ == "ZImagePipeline":
         from .pipeline_flux import FluxTeamworkPipeline
 
         return FluxTeamworkPipeline

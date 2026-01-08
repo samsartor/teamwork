@@ -7,6 +7,7 @@ dependencies = [
   "torch",
   "typer",
   "pillow",
+  "diffusers>=0.36.0",
 ]
 requires-python = ">=3.12"
 description = "Teamwork adapts pretrained diffusion models while also increasing the number of input and output channels."
