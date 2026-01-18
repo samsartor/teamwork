@@ -1,12 +1,13 @@
 import torch
 import torch.nn.functional as F
-from torch import Tensor
+from torch import Tensor, nn
 from typing import Any, Literal
 from diffusers.pipelines.flux.pipeline_flux import (
     FluxPipeline,
     retrieve_timesteps,
     calculate_shift,
 )
+from diffusers.models.transformers.transformer_flux import FluxTransformer2DModel, FluxSingleTransformerBlock, FluxTransformerBlock
 from diffusers.models.embeddings import CombinedTimestepGuidanceTextProjEmbeddings
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
@@ -16,9 +17,9 @@ import numpy as np
 
 from .pipelines import TeamworkPipeline, LossOutput
 from .config import TeamworkConfig
-from .adapter import adapt, save_adapters, TEAMWORK_PROFILES, Adapt, adapter_modules
+from .adapter import adapt, save_adapters, TEAMWORK_PROFILES, Adapt, adapter_modules, shallowcopy_into
 from .batch import BatchBuilder, OutputImageType
-from .attn import TeamworkJointAttention
+from .attn import FluxTeamworkJointAttention
 
 
 class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
@@ -27,6 +28,7 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
     empty_prompt_embeds: None | Tensor = None
     empty_pooled_prompt_embeds: None | Tensor = None
     empty_text_ids: None | Tensor = None
+    teamwork_joint_attn = False
 
     @classmethod
     def from_base_pipeline(
@@ -49,6 +51,9 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
             override_profile=override_profile,
             state=state,
         )
+        assert isinstance(pipeline.transformer, FluxTransformer2DModel)
+        if isinstance(pipeline.transformer.single_transformer_blocks[0], FluxSingleTransformerBlock):
+            pipeline.teamwork_joint_attn = True
         if training and grad_checkpointing:
             pipeline.transformer.enable_gradient_checkpointing()
         return pipeline
@@ -167,6 +172,13 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
                 latents.device,
                 latents.dtype,
             )
+            if self.teamwork_joint_attn:
+                image_ids_list = []
+                for teammate in sel.teammate_indices.tolist():
+                    this_image_ids = image_ids.clone()
+                    this_image_ids[:, 0] += teammate
+                    image_ids_list.append(this_image_ids)
+                image_ids = torch.cat(image_ids_list, 0)
 
             # Get prompt embeds if needed
             if self.text_encoder is None:
@@ -246,7 +258,7 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
         images: dict[str, Any] | list[dict[str, Any]],
         request: list[str] | Literal["all"] = "all",
         prompt: str = "",
-        num_inference_steps: int = 50,
+        num_inference_steps: int = 40,
         guidance_scale: float = 3.5,
         noise: Tensor | None = None,
         generator: torch.Generator | None = None,
@@ -290,6 +302,13 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
             latents.device,
             latents.dtype,
         )
+        if self.teamwork_joint_attn:
+            image_ids_list = []
+            for teammate in sel.teammate_indices.tolist():
+                this_image_ids = image_ids.clone()
+                this_image_ids[:, 0] += teammate
+                image_ids_list.append(this_image_ids)
+            image_ids = torch.cat(image_ids_list, 0)
 
         # Get prompt embeds if needed
         if (
@@ -405,6 +424,46 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
             return outputs[0]
 
 
+class TeamworkFluxSingleTransformerBlock(FluxSingleTransformerBlock):
+    def __init__(self, base: FluxSingleTransformerBlock, cfg: TeamworkConfig):
+        shallowcopy_into(self, base)
+        self.adapter = nn.Parameter(torch.tensor(0.0))
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        joint_attention_kwargs: dict[str, Any] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        text_seq_len = encoder_hidden_states.shape[1]
+        hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+
+        residual = hidden_states
+        norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
+        mlp_hidden_states = self.act_mlp(self.proj_mlp(norm_hidden_states))
+        joint_attention_kwargs = joint_attention_kwargs or {}
+        # TeamworkFluxJointAttnProcessor is refactored to cat img and txt branches internally
+        attn_output, encoder_attn_output = self.attn(
+            hidden_states=norm_hidden_states[:, text_seq_len:],
+            encoder_hidden_states=norm_hidden_states[:, :text_seq_len],
+            image_rotary_emb=image_rotary_emb,
+            **joint_attention_kwargs,
+        )
+        attn_output = torch.cat([encoder_attn_output, attn_output], dim=1)
+
+        hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
+        gate = gate.unsqueeze(1)
+        hidden_states = gate * self.proj_out(hidden_states)
+        hidden_states = residual + hidden_states
+        if hidden_states.dtype == torch.float16:
+            hidden_states = hidden_states.clip(-65504, 65504)
+
+        encoder_hidden_states, hidden_states = hidden_states[:, :text_seq_len], hidden_states[:, text_seq_len:]
+        return encoder_hidden_states, hidden_states
+
+
 TEAMWORK_PROFILES["FLUX"] = [
     "transformer_blocks.*.norm1.linear",
     "single_transformer_blocks.*.norm.linear",
@@ -423,5 +482,7 @@ TEAMWORK_PROFILES["FLUX"] = [
 
 TEAMWORK_PROFILES["FLUX_PLUSATTN"] = [
     *TEAMWORK_PROFILES["FLUX"],
-    ("transformer_blocks.*.attn", TeamworkJointAttention),
+    ("transformer_blocks.*.attn", FluxTeamworkJointAttention),
+    ("single_transformer_blocks.*", TeamworkFluxSingleTransformerBlock),
+    ("single_transformer_blocks.*.attn", FluxTeamworkJointAttention),
 ]

@@ -234,7 +234,10 @@ def adapt(
     profile_counts = defaultdict(lambda: 0)
     for name, adapt in resolve_paths_to_adapt(model, profile, known=known).items():
         new = adapt_single(original[name], adapt, cfg)
-        new.adapter = new.adapter.to(device=device, dtype=dtype)
+        if isinstance(new.adapter, nn.Parameter):
+            new.adapter = nn.Parameter(new.adapter.to(device=device, dtype=dtype))
+        else:
+            new.adapter = new.adapter.to(device=device, dtype=dtype)
         new.adapter.requires_grad_(requires_grad)
         replace_module(name, new)
         profile_counts[adapt] += 1
