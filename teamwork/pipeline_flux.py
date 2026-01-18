@@ -52,7 +52,7 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
             state=state,
         )
         assert isinstance(pipeline.transformer, FluxTransformer2DModel)
-        if isinstance(pipeline.transformer.single_transformer_blocks[0], FluxSingleTransformerBlock):
+        if isinstance(pipeline.transformer.single_transformer_blocks[0], TeamworkFluxSingleTransformerBlock):
             pipeline.teamwork_joint_attn = True
         if training and grad_checkpointing:
             pipeline.transformer.enable_gradient_checkpointing()
