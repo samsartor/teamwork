@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-from typing import Any, Literal
+from typing import Any, Literal, Callable
 from diffusers.pipelines.flux.pipeline_flux import (
     FluxPipeline,
     retrieve_timesteps,
@@ -50,6 +50,7 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
             requires_grad=training,
             override_profile=override_profile,
             state=state,
+            infer_layers_from_state=False,
         )
         assert isinstance(pipeline.transformer, FluxTransformer2DModel)
         if isinstance(pipeline.transformer.single_transformer_blocks[0], TeamworkFluxSingleTransformerBlock):
@@ -266,6 +267,7 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
         width: int | None = None,
         output_type: OutputImageType = "pil",
         batch: BatchBuilder | None = None,
+        callback_on_step_end: Callable[[int, int, dict], None] | None = None,
     ) -> dict[str, Any]:
         device = self._execution_device
         if batch is None:
@@ -358,7 +360,7 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
 
         # Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
-            for t in timesteps:
+            for i, t in enumerate(timesteps):
                 model_latents = latents
                 model_latents[sel.input_subindices] = clean_latents[
                     sel.input_subindices
@@ -414,6 +416,11 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
 
                 # Scheduler step
                 latents = self.scheduler.step(noise_pred, t, latents).prev_sample
+                if callback_on_step_end is not None:
+                    callback_kwargs = { 'latents': latents, 'selection': sel }
+                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+                    if callback_outputs is not None:
+                        latents = callback_outputs.pop("latents", latents)
 
                 progress_bar.update()
 

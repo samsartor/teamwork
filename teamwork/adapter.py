@@ -159,6 +159,7 @@ def adapt(
     override_profile: list[Adapt] | None = None,
     state: dict[str, torch.Tensor] | None = None,
     requires_grad: bool = False,
+    infer_layers_from_state: bool = True,
 ) -> nn.Module:
     """
     This function returns a new model with teamwork enabled, given a base model.
@@ -217,7 +218,7 @@ def adapt(
     # which layers are modified (instead of using the profile). We take
     # advantage of every adapted layer having a child called "adapter".
     known = None
-    if state is not None:
+    if state is not None and infer_layers_from_state:
         known = set()
         adapter_pattern = re.compile(r"(.+).adapter(\..+)?")
         for path in state.keys():
@@ -272,7 +273,7 @@ def adapter_parameters(module: nn.Module) -> OrderedDict[str, nn.Parameter]:
         for (mk, m) in adapter_modules(module).items()
         if isinstance(m, nn.Module)
         for (pk, p) in m.named_parameters()
-        if pk.startswith("adapter.")
+        if pk.startswith("adapter.") or pk == 'adapter'
     )
 
 
