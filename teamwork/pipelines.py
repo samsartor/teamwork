@@ -39,6 +39,7 @@ class TeamworkPipeline(ABC):
         filename: str | None = None,
         base_pipeline: Any | None = None,
         training: bool = False,
+        override_profile: list[Adapt] | None = None,
         **kwargs,
     ):
         """
@@ -65,7 +66,7 @@ class TeamworkPipeline(ABC):
         if cls == TeamworkPipeline:
             cls = automatic_pipeline(base_pipeline, config)
         pipe = cls.from_base_pipeline(
-            base_pipeline, config, state=state, training=training
+            base_pipeline, config, state=state, training=training, override_profile=override_profile,
         )
         pipe.load_extra_metadata(metadata)
         return pipe
