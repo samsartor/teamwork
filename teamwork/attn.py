@@ -44,6 +44,27 @@ def _teammate_block_mask(
         device=device,
     )
 
+@torch.compile
+def _masked_attention_impl(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    attn_keep: Tensor,
+    L_text: int,
+    L_img: int,
+    T: int,
+):
+    block_mask = _teammate_block_mask(
+        attn_keep, L_text, L_img, T, query.device
+    )
+    q = query.transpose(1, 2)
+    k = key.transpose(1, 2)
+    v = value.transpose(1, 2)
+    hidden_states = flex_attention(q, k, v, block_mask=block_mask)
+    assert isinstance(hidden_states, Tensor)
+    hidden_states = hidden_states.transpose(1, 2)
+    return hidden_states
+
 
 class TeamworkJointAttention(Attention, AdapterMixin):
     def __init__(self, base: Attention, cfg: TeamworkConfig):
@@ -283,6 +304,7 @@ class TeamworkFluxJointAttnProcessor(FluxAttnProcessor):
     def __init__(self):
         super().__init__()
 
+    @torch.compile
     def __call__(
         self,
         attn: "FluxAttention",
@@ -355,15 +377,15 @@ class TeamworkFluxJointAttnProcessor(FluxAttnProcessor):
             assert attention_mask is None, (
                 "attn_keep dropout and attention_mask cannot be combined"
             )
-            L_text = encoder_hidden_states.shape[1]
-            block_mask = _teammate_block_mask(
-                attn_keep, L_text, l, t, query.device
+            hidden_states = _masked_attention_impl(
+                query,
+                key,
+                value,
+                attn_keep,
+                encoder_hidden_states.shape[1],
+                l,
+                t
             )
-            q = query.transpose(1, 2)
-            k = key.transpose(1, 2)
-            v = value.transpose(1, 2)
-            hidden_states = flex_attention(q, k, v, block_mask=block_mask)
-            hidden_states = hidden_states.transpose(1, 2)
         else:
             hidden_states = dispatch_attention_fn(
                 query,
