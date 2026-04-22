@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import torch
 from torch import Tensor
+import torch.nn.functional as F
 import numpy as np
 from random import randint
 from typing import Callable, TypeAlias, Any, Literal
@@ -293,6 +294,20 @@ class BatchBuilder:
                 component.weight = component.weight[i : i + s, j : j + s]
             if component.extra is not None:
                 component.extra = component.extra[:, i : i + s, j : j + s]
+
+    def resize(self, width: int, height: int | None = None):
+        if height == None:
+            height = width
+            self.crop_to_square()
+        self.resolution = (height, width)
+        for component in self.components:
+            if component.image is not None:
+                component.image = F.interpolate(component.image.unsqueeze(0), self.resolution).squeeze(0)
+            if component.weight is not None:
+                component.weight = F.interpolate(component.weight.unsqueeze(0).unsqueeze(0), self.resolution).squeeze(0).squeeze(0)
+            if component.extra is not None:
+                component.extra = F.interpolate(component.extra.unsqueeze(0), self.resolution).squeeze(0)
+        
 
     def packed_images(self) -> Tensor:
         return self.packed_encoded_images(lambda x: x, 3, scale=1.0)
