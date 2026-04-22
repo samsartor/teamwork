@@ -15,6 +15,7 @@ class Selection:
     output_subindices: Tensor  # (output_components,): int
     batch_indices: Tensor # (components): int
     batch_matrix: Tensor # (components, batch): bool
+    attn_keep: Tensor | None = None # (components, components): bool, per-pair cross-teammate attention mask
 
 
 @dataclass
@@ -57,10 +58,17 @@ class BatchBuilder:
     image processing logic.
     """
 
-    def __init__(self, teammates: list[str], device: torch.device, dtype: torch.dtype):
+    def __init__(
+        self,
+        teammates: list[str],
+        device: torch.device,
+        dtype: torch.dtype,
+        dropout_prob: float = 0.0,
+    ):
         self.teammates = teammates
         self.device = device
         self.dtype = dtype
+        self.dropout_prob = dropout_prob
         self.components: list[ComponentInBatch] = []
         self.resolution: tuple[int, int] | None = None
 
@@ -74,8 +82,9 @@ class BatchBuilder:
         request: list[str] | Literal["all"] = "all",
         height: int | None = None,
         width: int | None = None,
+        dropout_prob: float = 0.0,
     ):
-        batch = cls(teammates, device, dtype)
+        batch = cls(teammates, device, dtype, dropout_prob=dropout_prob)
         if not isinstance(images, list):
             images = [images]
         for batch_idx, images_dict in enumerate(images):
@@ -259,9 +268,9 @@ class BatchBuilder:
                     )
 
     def split_io(self) -> tuple["BatchBuilder", "BatchBuilder"]:
-        inputs = BatchBuilder(self.teammates, self.device, self.dtype)
+        inputs = BatchBuilder(self.teammates, self.device, self.dtype, dropout_prob=self.dropout_prob)
         inputs.resolution = self.resolution
-        outputs = BatchBuilder(self.teammates, self.device, self.dtype)
+        outputs = BatchBuilder(self.teammates, self.device, self.dtype, dropout_prob=self.dropout_prob)
         outputs.resolution = self.resolution
         for component in self.components:
             if component.output:
@@ -422,6 +431,14 @@ class BatchBuilder:
             batch_indices.append(component.batch_idx)
             batch_matrix[i, component.batch_idx] = True
 
+        attn_keep: Tensor | None = None
+        if self.dropout_prob > 0 and self.count > 1:
+            keep = torch.bernoulli(
+                torch.full((self.count, self.count), 1.0 - self.dropout_prob)
+            ).bool()
+            keep.fill_diagonal_(True)
+            attn_keep = keep.to(self.device)
+
         return Selection(
             enabled=True,
             teammate_indices=torch.tensor(
@@ -437,6 +454,7 @@ class BatchBuilder:
                 batch_indices, dtype=torch.int64, device=self.device
             ),
             batch_matrix=batch_matrix.to(self.device),
+            attn_keep=attn_keep,
         )
 
     def unpack_decoded_images(

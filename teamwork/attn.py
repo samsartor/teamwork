@@ -1,6 +1,7 @@
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 from diffusers.models.attention_processor import (
     Attention,
     AttnProcessor2_0,
@@ -11,6 +12,37 @@ from diffusers.models.transformers.transformer_flux import FluxAttention, FluxAt
 from einops import rearrange
 
 from .adapter import AdapterMixin, TeamworkConfig, shallowcopy_into
+
+
+def _teammate_block_mask(
+    attn_keep: Tensor,
+    L_text: int,
+    L_img: int,
+    T: int,
+    device: torch.device,
+):
+    """
+    Build a flex_attention BlockMask over `[text, img_t0, img_t1, ..., img_tT-1]`.
+    Text rows/cols are always unmasked; image-image edges follow `attn_keep[q_team, k_team]`.
+    """
+    total_len = L_text + T * L_img
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        q_is_text = q_idx < L_text
+        k_is_text = kv_idx < L_text
+        q_team = torch.clamp((q_idx - L_text) // L_img, 0, T - 1)
+        k_team = torch.clamp((kv_idx - L_text) // L_img, 0, T - 1)
+        keep_edge = attn_keep[q_team, k_team]
+        return q_is_text | k_is_text | keep_edge
+
+    return create_block_mask(
+        mask_mod,
+        B=None,
+        H=None,
+        Q_LEN=total_len,
+        KV_LEN=total_len,
+        device=device,
+    )
 
 
 class TeamworkJointAttention(Attention, AdapterMixin):
@@ -318,12 +350,27 @@ class TeamworkFluxJointAttnProcessor(FluxAttnProcessor):
             assert isinstance(query, Tensor)
             assert isinstance(key, Tensor)
 
-        hidden_states = dispatch_attention_fn(
-            query,
-            key,
-            value,
-            attn_mask=attention_mask,
-        )
+        attn_keep = attn.selection.attn_keep
+        if attn_keep is not None:
+            assert attention_mask is None, (
+                "attn_keep dropout and attention_mask cannot be combined"
+            )
+            L_text = encoder_hidden_states.shape[1]
+            block_mask = _teammate_block_mask(
+                attn_keep, L_text, l, t, query.device
+            )
+            q = query.transpose(1, 2)
+            k = key.transpose(1, 2)
+            v = value.transpose(1, 2)
+            hidden_states = flex_attention(q, k, v, block_mask=block_mask)
+            hidden_states = hidden_states.transpose(1, 2)
+        else:
+            hidden_states = dispatch_attention_fn(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask,
+            )
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 
