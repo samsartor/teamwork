@@ -174,8 +174,11 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
                 latents.dtype,
             )
             if self.teamwork_joint_attn:
+                # Build per-teammate (not per-component) image ids so the rotary
+                # embedding is batch-invariant and matches the (L_text + T*L_img)
+                # seq layout used by TeamworkFluxJointAttnProcessor.
                 image_ids_list = []
-                for teammate in sel.teammate_indices.tolist():
+                for teammate in range(sel.num_teammates):
                     this_image_ids = image_ids.clone()
                     this_image_ids[:, 0] += teammate
                     image_ids_list.append(this_image_ids)
@@ -279,6 +282,7 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
                  request=request,
                  width=width,
                  height=height,
+                 attn_allow=self.teamwork_config.attn_allow,
             )
 
         # Initialize latents
@@ -305,8 +309,11 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
             latents.dtype,
         )
         if self.teamwork_joint_attn:
+            # Build per-teammate (not per-component) image ids so the rotary
+            # embedding is batch-invariant and matches the (L_text + T*L_img)
+            # seq layout used by TeamworkFluxJointAttnProcessor.
             image_ids_list = []
-            for teammate in sel.teammate_indices.tolist():
+            for teammate in range(sel.num_teammates):
                 this_image_ids = image_ids.clone()
                 this_image_ids[:, 0] += teammate
                 image_ids_list.append(this_image_ids)

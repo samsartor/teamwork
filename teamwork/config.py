@@ -5,6 +5,39 @@ from typing import Any
 TEAMMATE_FMT = re.compile(r"[a-z]+\.(in|out)")
 
 
+def parse_attn_allow(s: str, num_teammates: int) -> list[list[bool]]:
+    """
+    Parse a row-major bool matrix from a serialized string like ``"100;011;011"``.
+
+    Whitespace is tolerated within and between rows. The matrix must be square of
+    side ``num_teammates`` and have an all-True diagonal (a teammate must always
+    be allowed to attend to itself).
+    """
+    rows = [r.strip().replace(" ", "") for r in s.split(";")]
+    rows = [r for r in rows if r]
+    if len(rows) != num_teammates:
+        raise ValueError(
+            f"attn_allow must have {num_teammates} rows, got {len(rows)}: {s!r}"
+        )
+    matrix: list[list[bool]] = []
+    for i, row in enumerate(rows):
+        if len(row) != num_teammates:
+            raise ValueError(
+                f"attn_allow row {i} must have {num_teammates} chars, got {len(row)}: {row!r}"
+            )
+        if any(c not in "01" for c in row):
+            raise ValueError(
+                f"attn_allow row {i} must contain only '0'/'1', got {row!r}"
+            )
+        bools = [c == "1" for c in row]
+        if not bools[i]:
+            raise ValueError(
+                f"attn_allow diagonal must be '1' at position {i}, got '0' in row {row!r}"
+            )
+        matrix.append(bools)
+    return matrix
+
+
 @dataclass(frozen=True)
 class TeamworkConfig:
     """
@@ -16,6 +49,9 @@ class TeamworkConfig:
         lora_rank: the default rank of teamwork LoRAs
         lora_communication: whether to communicate between teammates via LoRA layers, or keep the LoRAs separate (useful as a baseline)
         use_bias: whether to train per-teammate bias for linear layers with a bias
+        attn_allow: row-major bool matrix (e.g. ``"100;011;011"``) of allowed cross-teammate
+            attention edges, or None for "all allowed". Diagonal must be ``1``. Combined
+            multiplicatively with attention dropout to produce the runtime ``attn_keep``.
 
     General Attributes:
         base_model: The checkpoint or model name from which the adapter was or will be trained
@@ -33,11 +69,14 @@ class TeamworkConfig:
     profile: str | None = None
     lora_communication: bool = True
     use_bias: bool = True
+    attn_allow: str | None = None
 
     def __post_init__(self):
         for teammate in self.teammates:
             if TEAMMATE_FMT.fullmatch(teammate) is None:
                 raise ValueError(f"{teammate} does not match {TEAMMATE_FMT}")
+        if self.attn_allow is not None:
+            parse_attn_allow(self.attn_allow, len(self.teammates))
 
 
 def config_to_metadata(cfg: TeamworkConfig) -> dict[str, str]:

@@ -7,6 +7,8 @@ from random import randint
 from typing import Callable, TypeAlias, Any, Literal
 import PIL.Image
 
+from .config import parse_attn_allow
+
 
 @dataclass(frozen=True)
 class Selection:
@@ -16,7 +18,10 @@ class Selection:
     output_subindices: Tensor  # (output_components,): int
     batch_indices: Tensor # (components): int
     batch_matrix: Tensor # (components, batch): bool
-    attn_keep: Tensor | None = None # (components, components): bool, per-pair cross-teammate attention mask
+    num_teammates: int  # T, the size of the teammate roster (>= max teammate_indices + 1)
+    present_matrix: Tensor # (batch, num_teammates): bool, whether each (batch, teammate) slot has a component
+    first_component_per_batch: Tensor # (batch,): int, index of the first component belonging to each batch
+    attn_keep: Tensor | None = None # (num_teammates, num_teammates): bool, per-pair cross-teammate attention mask
 
 
 @dataclass
@@ -65,11 +70,20 @@ class BatchBuilder:
         device: torch.device,
         dtype: torch.dtype,
         dropout_prob: float = 0.0,
+        attn_allow: str | None = None,
     ):
         self.teammates = teammates
         self.device = device
         self.dtype = dtype
         self.dropout_prob = dropout_prob
+        self.attn_allow = attn_allow
+        if attn_allow is not None:
+            rows = parse_attn_allow(attn_allow, len(teammates))
+            self._attn_allow_tensor: Tensor | None = torch.tensor(
+                rows, dtype=torch.bool
+            )
+        else:
+            self._attn_allow_tensor = None
         self.components: list[ComponentInBatch] = []
         self.resolution: tuple[int, int] | None = None
 
@@ -84,8 +98,12 @@ class BatchBuilder:
         height: int | None = None,
         width: int | None = None,
         dropout_prob: float = 0.0,
+        attn_allow: str | None = None,
     ):
-        batch = cls(teammates, device, dtype, dropout_prob=dropout_prob)
+        batch = cls(
+            teammates, device, dtype,
+            dropout_prob=dropout_prob, attn_allow=attn_allow,
+        )
         if not isinstance(images, list):
             images = [images]
         for batch_idx, images_dict in enumerate(images):
@@ -269,9 +287,9 @@ class BatchBuilder:
                     )
 
     def split_io(self) -> tuple["BatchBuilder", "BatchBuilder"]:
-        inputs = BatchBuilder(self.teammates, self.device, self.dtype, dropout_prob=self.dropout_prob)
+        inputs = BatchBuilder(self.teammates, self.device, self.dtype, dropout_prob=self.dropout_prob, attn_allow=self.attn_allow)
         inputs.resolution = self.resolution
-        outputs = BatchBuilder(self.teammates, self.device, self.dtype, dropout_prob=self.dropout_prob)
+        outputs = BatchBuilder(self.teammates, self.device, self.dtype, dropout_prob=self.dropout_prob, attn_allow=self.attn_allow)
         outputs.resolution = self.resolution
         for component in self.components:
             if component.output:
@@ -435,7 +453,12 @@ class BatchBuilder:
         input_indices = []
         output_indices = []
         batch_indices = []
+        T = len(self.teammates)
         batch_matrix = torch.zeros(self.count, self.batch_size, dtype=torch.bool)
+        present_matrix = torch.zeros(self.batch_size, T, dtype=torch.bool)
+        first_component_per_batch = torch.full(
+            (self.batch_size,), -1, dtype=torch.int64
+        )
 
         for i, component in enumerate(self.components):
             teammate_indices.append(component.teammate)
@@ -445,14 +468,26 @@ class BatchBuilder:
                 input_indices.append(i)
             batch_indices.append(component.batch_idx)
             batch_matrix[i, component.batch_idx] = True
+            present_matrix[component.batch_idx, component.teammate] = True
+            if first_component_per_batch[component.batch_idx] == -1:
+                first_component_per_batch[component.batch_idx] = i
 
+        # attn_keep gates cross-teammate attention; combine the static allow matrix
+        # (from cfg) with random dropout. Diagonal is always True so a teammate can
+        # always self-attend. Drop the tensor entirely when it would be all-True
+        # (the BlockMask fast-path).
+        allow = self._attn_allow_tensor
+        if self.dropout_prob > 0 and T > 1:
+            drop = torch.bernoulli(torch.full((T, T), 1.0 - self.dropout_prob)).bool()
+            keep = drop if allow is None else (allow & drop)
+        else:
+            keep = allow
         attn_keep: Tensor | None = None
-        if self.dropout_prob > 0 and self.count > 1:
-            keep = torch.bernoulli(
-                torch.full((self.count, self.count), 1.0 - self.dropout_prob)
-            ).bool()
+        if keep is not None:
+            keep = keep.clone()
             keep.fill_diagonal_(True)
-            attn_keep = keep.to(self.device)
+            if not bool(keep.all()):
+                attn_keep = keep.to(self.device)
 
         return Selection(
             enabled=True,
@@ -469,6 +504,9 @@ class BatchBuilder:
                 batch_indices, dtype=torch.int64, device=self.device
             ),
             batch_matrix=batch_matrix.to(self.device),
+            num_teammates=T,
+            present_matrix=present_matrix.to(self.device),
+            first_component_per_batch=first_component_per_batch.to(self.device),
             attn_keep=attn_keep,
         )
 

@@ -9,61 +9,106 @@ from diffusers.models.attention_processor import (
     FluxAttnProcessor2_0,
 )
 from diffusers.models.transformers.transformer_flux import FluxAttention, FluxAttnProcessor
+from diffusers.models.embeddings import apply_rotary_emb
 from einops import rearrange
 
 from .adapter import AdapterMixin, TeamworkConfig, shallowcopy_into
 
 
 def _teammate_block_mask(
-    attn_keep: Tensor,
+    present: Tensor,
+    attn_keep: Tensor | None,
     L_text: int,
     L_img: int,
     T: int,
     device: torch.device,
 ):
     """
-    Build a flex_attention BlockMask over `[text, img_t0, img_t1, ..., img_tT-1]`.
-    Text rows/cols are always unmasked; image-image edges follow `attn_keep[q_team, k_team]`.
+    Build a flex_attention BlockMask over `[text(L_text), img_t0(L_img), ..., img_t{T-1}(L_img)]`
+    with a per-batch dim. Edges are kept iff:
+      - both endpoints are present in the batch (text always counts as present), AND
+      - either endpoint is text, or `attn_keep[q_team, k_team]` is True (when provided).
     """
     total_len = L_text + T * L_img
+    B = present.shape[0]
 
     def mask_mod(b, h, q_idx, kv_idx):
         q_is_text = q_idx < L_text
         k_is_text = kv_idx < L_text
         q_team = torch.clamp((q_idx - L_text) // L_img, 0, T - 1)
         k_team = torch.clamp((kv_idx - L_text) // L_img, 0, T - 1)
-        keep_edge = attn_keep[q_team, k_team]
-        return q_is_text | k_is_text | keep_edge
+        q_ok = q_is_text | present[b, q_team]
+        k_ok = k_is_text | present[b, k_team]
+        if attn_keep is None:
+            edge_ok = q_is_text | k_is_text | torch.tensor(True, device=device)
+        else:
+            edge_ok = q_is_text | k_is_text | attn_keep[q_team, k_team]
+        return q_ok & k_ok & edge_ok
 
     return create_block_mask(
         mask_mod,
-        B=None,
+        B=B,
         H=None,
         Q_LEN=total_len,
         KV_LEN=total_len,
         device=device,
     )
 
+
 @torch.compile
 def _masked_attention_impl(
-    query: Tensor,
-    key: Tensor,
-    value: Tensor,
-    attn_keep: Tensor,
-    L_text: int,
-    L_img: int,
-    T: int,
+    img_query: Tensor,  # (T_components, L_img, H, F)
+    img_key: Tensor,
+    img_value: Tensor,
+    txt_query: Tensor,  # (B, L_text, H, F)
+    txt_key: Tensor,
+    txt_value: Tensor,
+    image_rotary_emb: tuple[Tensor, Tensor] | None,  # (cos, sin), each (L_text + T*L_img, D)
+    batch_indices: Tensor,    # (T_components,): int
+    teammate_indices: Tensor, # (T_components,): int
+    present: Tensor,          # (B, T): bool
+    attn_keep: Tensor | None, # (T, T): bool
 ):
+    """
+    Run flex_attention over the dense (B, L_text + T*L_img, H, F) layout, scattering image
+    components into per-(batch, teammate) slots and gathering the image output back into
+    components form. Returns (img_out, txt_out).
+    """
+    B, T = present.shape
+    Tc, L_img, H, Fd = img_query.shape
+    L_text = txt_query.shape[1]
+
+    def scatter_dense(x: Tensor) -> Tensor:
+        dense = x.new_zeros(B, T, L_img, H, Fd)
+        dense[batch_indices, teammate_indices] = x
+        return dense.reshape(B, T * L_img, H, Fd)
+
+    q = torch.cat([txt_query, scatter_dense(img_query)], dim=1)
+    k = torch.cat([txt_key,   scatter_dense(img_key)],   dim=1)
+    v = torch.cat([txt_value, scatter_dense(img_value)], dim=1)
+
+    if image_rotary_emb is not None:
+        q = apply_rotary_emb(q, image_rotary_emb, sequence_dim=1)
+        k = apply_rotary_emb(k, image_rotary_emb, sequence_dim=1)
+        assert isinstance(q, Tensor)
+        assert isinstance(k, Tensor)
+
+    # flex_attention expects (B, H, S, F)
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+
     block_mask = _teammate_block_mask(
-        attn_keep, L_text, L_img, T, query.device
+        present, attn_keep, L_text, L_img, T, q.device
     )
-    q = query.transpose(1, 2)
-    k = key.transpose(1, 2)
-    v = value.transpose(1, 2)
-    hidden_states = flex_attention(q, k, v, block_mask=block_mask)
-    assert isinstance(hidden_states, Tensor)
-    hidden_states = hidden_states.transpose(1, 2)
-    return hidden_states
+    out = flex_attention(q, k, v, block_mask=block_mask)
+    assert isinstance(out, Tensor)
+    out = out.transpose(1, 2)  # (B, S, H, F)
+
+    txt_out = out[:, :L_text]
+    img_dense = out[:, L_text:].reshape(B, T, L_img, H, Fd)
+    img_out = img_dense[batch_indices, teammate_indices]
+    return img_out, txt_out
 
 
 class TeamworkJointAttention(Attention, AdapterMixin):
@@ -96,6 +141,11 @@ class TeamworkAttnProcessor(AttnProcessor2_0):
         attention_mask: Tensor | None = None,
         temb: Tensor | None = None,
     ) -> torch.Tensor:
+        assert isinstance(attn, TeamworkJointAttention)
+        assert attn.selection is None or attn.selection.attn_keep is None, (
+            "TeamworkAttnProcessor does not implement attn_keep gating; "
+            "use a flex_attention-based processor (e.g. TeamworkFluxJointAttnProcessor) instead"
+        )
         residual = hidden_states
         if attn.spatial_norm is not None:
             hidden_states = attn.spatial_norm(hidden_states, temb)
@@ -207,6 +257,11 @@ class TeamworkJointAttnProcessor(JointAttnProcessor2_0):
         *args,
         **kwargs,
     ):
+        assert isinstance(attn, TeamworkJointAttention)
+        assert attn.selection is None or attn.selection.attn_keep is None, (
+            "TeamworkJointAttnProcessor does not implement attn_keep gating; "
+            "use a flex_attention-based processor (e.g. TeamworkFluxJointAttnProcessor) instead"
+        )
         residual = hidden_states
 
         batch_size = hidden_states.shape[0]
@@ -313,12 +368,14 @@ class TeamworkFluxJointAttnProcessor(FluxAttnProcessor):
         attention_mask: torch.Tensor | None = None,
         image_rotary_emb: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        from diffusers.models.transformers.transformer_flux import _get_qkv_projections
-        from diffusers.models.embeddings import apply_rotary_emb
-        from diffusers.models.attention_dispatch import dispatch_attention_fn
-        
         assert isinstance(attn, FluxTeamworkJointAttention)
         assert encoder_hidden_states is not None
+        assert attention_mask is None, (
+            "TeamworkFluxJointAttnProcessor handles masking via the BlockMask "
+            "(present_matrix + attn_keep); external attention_mask is not supported"
+        )
+        sel = attn.selection
+        assert sel is not None
 
         query = attn.to_q(hidden_states)
         key = attn.to_k(hidden_states)
@@ -330,84 +387,64 @@ class TeamworkFluxJointAttnProcessor(FluxAttnProcessor):
             encoder_key = attn.add_k_proj(encoder_hidden_states)
             encoder_value = attn.add_v_proj(encoder_hidden_states)
         else:
-            # double single block
+            # single block: text shares the same QKV projection as image
             encoder_query = attn.to_q(encoder_hidden_states)
             encoder_key = attn.to_k(encoder_hidden_states)
             encoder_value = attn.to_v(encoder_hidden_states)
 
-        query = query.unflatten(-1, (attn.heads, -1))
+        query = query.unflatten(-1, (attn.heads, -1))           # (Tc, L_img, H, F)
         key = key.unflatten(-1, (attn.heads, -1))
         value = value.unflatten(-1, (attn.heads, -1))
-        encoder_query = encoder_query.unflatten(-1, (attn.heads, -1))
+        encoder_query = encoder_query.unflatten(-1, (attn.heads, -1))  # (Tc, L_text, H, F)
         encoder_key = encoder_key.unflatten(-1, (attn.heads, -1))
         encoder_value = encoder_value.unflatten(-1, (attn.heads, -1))
 
-        assert attn.selection is not None
-        if attn.selection.batch_matrix.shape[1] != 1:
-            raise NotImplementedError('all of teamwork, batching, and joint attention')
-        t, l, h, _ = query.shape
-        query = rearrange(query, "(b t) l h f -> b (t l) h f", b=1, t=t, h=h, l=l)
-        key   = rearrange(key,   "(b t) l h f -> b (t l) h f", b=1, t=t, h=h, l=l)
-        value = rearrange(value, "(b t) l h f -> b (t l) h f", b=1, t=t, h=h, l=l)
-    
         if attn.added_kv_proj_dim is not None:
-            # double block, normalize separately
+            # double block: image and text use separate norms
             query = attn.norm_q(query)
             key = attn.norm_k(key)
             encoder_query = attn.norm_added_q(encoder_query)
             encoder_key = attn.norm_added_k(encoder_key)
-    
-        query = torch.cat([encoder_query[:1, ...], query], dim=1)
-        key = torch.cat([encoder_key[:1, ...], key], dim=1)
-        value = torch.cat([encoder_value[:1, ...], value], dim=1)
-
-        if attn.added_kv_proj_dim is None:
-            # sngle blouck, normalize together  
+        else:
+            # single block: image and text share norm_q/norm_k. RMSNorm acts only on the
+            # head dim, so applying it before vs. after the dense scatter is equivalent.
             query = attn.norm_q(query)
             key = attn.norm_k(key)
+            encoder_query = attn.norm_q(encoder_query)
+            encoder_key = attn.norm_k(encoder_key)
 
-        if image_rotary_emb is not None:
-            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
-            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
-            assert isinstance(query, Tensor)
-            assert isinstance(key, Tensor)
+        # One text QKV per batch element (B, L_text, H, F). Each component duplicates
+        # the same per-batch text via the projection's per-teammate LoRA, so picking
+        # the first component per batch matches the original [:1] semantics for B=1.
+        fcb = sel.first_component_per_batch
+        txt_q = encoder_query[fcb]
+        txt_k = encoder_key[fcb]
+        txt_v = encoder_value[fcb]
 
-        attn_keep = attn.selection.attn_keep
-        if attn_keep is not None:
-            assert attention_mask is None, (
-                "attn_keep dropout and attention_mask cannot be combined"
-            )
-            hidden_states = _masked_attention_impl(
-                query,
-                key,
-                value,
-                attn_keep,
-                encoder_hidden_states.shape[1],
-                l,
-                t
-            )
-        else:
-            hidden_states = dispatch_attention_fn(
-                query,
-                key,
-                value,
-                attn_mask=attention_mask,
-            )
-        hidden_states = hidden_states.flatten(2, 3)
-        hidden_states = hidden_states.to(query.dtype)
-
-        encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
-            [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
+        img_out, txt_out = _masked_attention_impl(
+            query, key, value,
+            txt_q, txt_k, txt_v,
+            image_rotary_emb,
+            sel.batch_indices,
+            sel.teammate_indices,
+            sel.present_matrix,
+            sel.attn_keep,
         )
-        hidden_states = rearrange(hidden_states, "b (t l) f -> (b t) l f", b=1, t=t, l=l)
-        if attn.added_kv_proj_dim is not None:
-            hidden_states = attn.to_out[0](hidden_states)
-            hidden_states = attn.to_out[1](hidden_states)
-            encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
-            assert encoder_hidden_states is not None
-        encoder_hidden_states = encoder_hidden_states.repeat_interleave(hidden_states.shape[0], 0)
 
-        return hidden_states, encoder_hidden_states # type: ignore
+        img_out = img_out.flatten(-2, -1).to(query.dtype)  # (Tc, L_img, dim)
+        txt_out = txt_out.flatten(-2, -1).to(query.dtype)  # (B, L_text, dim)
+
+        if attn.added_kv_proj_dim is not None:
+            img_out = attn.to_out[0](img_out)
+            img_out = attn.to_out[1](img_out)
+            txt_out = attn.to_add_out(txt_out)
+            assert txt_out is not None
+
+        # Broadcast text output from per-batch back to per-component, indexed by the
+        # batch each component belongs to. Equivalent to repeat_interleave when B=1.
+        encoder_hidden_states_out = txt_out[sel.batch_indices]
+
+        return img_out, encoder_hidden_states_out  # type: ignore
         
  
 class FluxTeamworkJointAttention(FluxAttention, AdapterMixin):
