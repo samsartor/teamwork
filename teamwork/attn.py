@@ -101,7 +101,16 @@ def _masked_attention_impl(
     block_mask = _teammate_block_mask(
         present, attn_keep, L_text, L_img, T, q.device
     )
-    out = flex_attention(q, k, v, block_mask=block_mask)
+    # On GPUs with <128 KiB dynamic smem per block (A40/A6000/4090/L40), the
+    # autotuner's default flex_attention configs don't fit at head_dim=128 once
+    # mask_mod captures attn_keep — every config OOMs and Triton bails with
+    # "no valid triton configs". Force a smaller tile + single pipeline stage.
+    props = torch.cuda.get_device_properties(q.device)
+    if props.shared_memory_per_block_optin < 128 * 1024:
+        kernel_options = {"BLOCK_M": 64, "BLOCK_N": 64, "num_stages": 1}
+    else:
+        kernel_options = None
+    out = flex_attention(q, k, v, block_mask=block_mask, kernel_options=kernel_options)
     assert isinstance(out, Tensor)
     out = out.transpose(1, 2)  # (B, S, H, F)
 
