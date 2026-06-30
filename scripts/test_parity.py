@@ -123,6 +123,23 @@ CASES = {
         num_components=2,
         exact=True,
     ),
+    "flux2-plusattn": dict(
+        repo="black-forest-labs/FLUX.2-klein-4B",
+        model_cls="Flux2Transformer2DModel",
+        profile="FLUX2_PLUSATTN",
+        n_axes=4,
+        in_channels=128,
+        joint_dim=7680,
+        pooled_dim=None,
+        guidance=None,
+        teammates=["image.out"],
+        num_components=1,  # single teammate => equals base self-attention
+        exact=False,
+        # 4B fits in fp32, so use it for a tight (kernel-only) gate. In bf16 the
+        # flex-vs-sdpa noise over deep head_dim=128 single blocks is ~3%, which is
+        # too coarse to catch a structural regression here.
+        dtype="fp32",
+    ),
 }
 
 
@@ -134,11 +151,14 @@ def load_transformer(case, device, dtype):
     return M.from_pretrained(case["repo"], subfolder="transformer", torch_dtype=dtype).to(device)
 
 
-def run_case(name, device, dtype, h=16, w=16, txt_len=32):
+def run_case(name, device, base_dtype, h=16, w=16, txt_len=32):
     case = CASES[name]
     if case["profile"] not in TEAMWORK_PROFILES:
         print(f"[SKIP] {name}: profile {case['profile']} not registered")
         return None
+
+    # A case may pin fp32 for a tight gate; the env override forces fp32 globally.
+    dtype = torch.float32 if (case.get("dtype") == "fp32" or base_dtype == torch.float32) else base_dtype
 
     base = load_transformer(case, device, dtype)
     base.eval()
@@ -167,6 +187,9 @@ def run_case(name, device, dtype, h=16, w=16, txt_len=32):
     )
     for m in adapter_modules(adapted).values():
         m.selection = sel
+        # Single (parallel) teamwork blocks need the text/image split point.
+        if hasattr(m, "text_seq_len"):
+            m.text_seq_len = txt_len
 
     B = case["num_components"]
     torch.manual_seed(0)
@@ -196,10 +219,16 @@ def run_case(name, device, dtype, h=16, w=16, txt_len=32):
 
     diff = (out_base.float() - out_adapted.float()).abs().max().item()
     scale = out_base.float().abs().max().item()
-    tol = 0.0 if case["exact"] else 2e-2 * max(scale, 1.0)
+    if case["exact"]:
+        tol = 0.0
+    else:
+        # fp32 isolates structural correctness (kernel-only ~1e-4); bf16 is a
+        # coarser check that still catches gross regressions.
+        rel = 1e-3 if dtype == torch.float32 else 6e-2
+        tol = rel * max(scale, 1.0)
     ok = diff <= tol
     status = "PASS" if ok else "FAIL"
-    kind = "exact" if case["exact"] else f"tol={tol:.2e}"
+    kind = "exact" if case["exact"] else f"{str(dtype).split('.')[-1]}, tol={tol:.2e}"
     print(f"[{status}] {name} ({case['profile']}, {kind}): "
           f"max-abs-diff={diff:.3e}, out-scale={scale:.3e}")
 
