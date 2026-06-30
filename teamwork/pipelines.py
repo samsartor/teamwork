@@ -199,6 +199,10 @@ def automatic_pipeline(base: Any, config: TeamworkConfig) -> type[TeamworkPipeli
         from .pipeline_flux import FluxTeamworkPipeline
 
         return FluxTeamworkPipeline
+    if base_type.__name__ == "Flux2KleinPipeline":
+        from .pipeline_flux2_klein import Flux2TeamworkPipeline
+
+        return Flux2TeamworkPipeline
     raise NotImplementedError(
         f"automatic teamwork pipeline for {base_type} ({config.base_model})"
     )

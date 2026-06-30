@@ -8,7 +8,7 @@ dependencies = [
   "typer",
   "pillow",
 ]
-requires-python = ">=3.12"
+requires-python = "~=3.12.0"
 description = "Teamwork adapts pretrained diffusion models while also increasing the number of input and output channels."
 readme = "README.md"
 license = "MIT AND Apache-2.0"
@@ -22,7 +22,7 @@ build-backend = "hatchling.build"
 
 [project.optional-dependencies]
 diffusers = [
-  "diffusers",
+  "diffusers==0.37.1",
   "huggingface_hub",
   "transformers",
   "accelerate",
