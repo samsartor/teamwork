@@ -8,7 +8,11 @@ from diffusers.pipelines.flux2.pipeline_flux2_klein import (
     retrieve_timesteps,
     compute_empirical_mu,
 )
-from diffusers.models.transformers.transformer_flux2 import Flux2Transformer2DModel
+from diffusers.models.transformers.transformer_flux2 import (
+    Flux2Transformer2DModel,
+    Flux2SingleTransformerBlock,
+    Flux2Modulation,
+)
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
@@ -17,8 +21,35 @@ import numpy as np
 
 from .pipelines import TeamworkPipeline, LossOutput
 from .config import TeamworkConfig
-from .adapter import adapt, save_adapters, TEAMWORK_PROFILES, Adapt, adapter_modules, shallowcopy_into
+from .adapter import adapt, save_adapters, TEAMWORK_PROFILES, Adapt, adapter_modules, shallowcopy_into, AdapterMixin
 from .batch import BatchBuilder, OutputImageType
+from .attn import Flux2TeamworkJointAttention, teamwork_joint_attention
+
+
+# Flux2 assigns reference/conditioning images RoPE T-coords of 10, 20, ... (see
+# Flux2KleinPipeline._prepare_image_ids, scale=10) while the generated image is
+# T=0. Teamwork mirrors this so zero-LoRA joint attention reduces to base editing.
+KLEIN_IMAGE_ID_SCALE = 10
+
+
+def klein_teammate_t_offsets(teammates: list[str]) -> list[int]:
+    """RoPE T-coord offset per teammate for the joint-attention layout.
+
+    Output teammates (``*.out``, the images being generated) sit at T=0, matching
+    the base model's denoised image. Input teammates (``*.in``, references/
+    conditioning) are placed at T=10, 20, ... in list order, matching klein's
+    reference-image convention. Assumes a single generated stream (multiple
+    ``.out`` teammates would all share T=0, which klein was not trained on).
+    """
+    offsets = []
+    ref_rank = 0
+    for name in teammates:
+        if name.endswith(".out"):
+            offsets.append(0)
+        else:
+            ref_rank += 1
+            offsets.append(ref_rank * KLEIN_IMAGE_ID_SCALE)
+    return offsets
 
 
 class Flux2TeamworkPipeline(TeamworkPipeline, Flux2KleinPipeline):
@@ -51,9 +82,11 @@ class Flux2TeamworkPipeline(TeamworkPipeline, Flux2KleinPipeline):
             infer_layers_from_state=False,
         )
         assert isinstance(pipeline.transformer, Flux2Transformer2DModel)
-        # TODO(joint-attn revision): set teamwork_joint_attn=True when the
-        # FLUX2_PLUSATTN profile (cross-teammate attention + parallel single
-        # block) is implemented.
+        if isinstance(
+            pipeline.transformer.single_transformer_blocks[0],
+            TeamworkFlux2SingleTransformerBlock,
+        ):
+            pipeline.teamwork_joint_attn = True
         if training and grad_checkpointing:
             pipeline.transformer.enable_gradient_checkpointing()
         return pipeline
@@ -117,6 +150,25 @@ class Flux2TeamworkPipeline(TeamworkPipeline, Flux2KleinPipeline):
         ids[:, 2] = torch.arange(ww, device=device).repeat(hh)
         return ids
 
+    def _joint_image_ids(self, image_ids: Tensor, num_teammates: int) -> Tensor:
+        """Per-teammate image ids for the (L_text + T*L_img) joint-attention layout.
+
+        Each teammate's image gets its own RoPE T-coord so that, with zero LoRA,
+        the layout matches the base klein editing model: generated (output)
+        teammates sit at T=0 and reference (input) teammates at T=10, 20, ...
+        (Flux2's `_prepare_image_ids` scale), which is where klein was trained to
+        find conditioning images. Using naive offsets (0, 1, 2, ...) puts the
+        reference adjacent to the generation and yields garbage at init -- see
+        scripts/test_edit_parity.py.
+        """
+        offsets = klein_teammate_t_offsets(self.teamwork_config.teammates)
+        parts = []
+        for t in range(num_teammates):
+            ids = image_ids.clone()
+            ids[:, 0] += offsets[t]
+            parts.append(ids)
+        return torch.cat(parts, 0)
+
     def train_loss(
         self,
         batch: BatchBuilder,
@@ -168,15 +220,7 @@ class Flux2TeamworkPipeline(TeamworkPipeline, Flux2KleinPipeline):
             b, _, lh, lw = latents.shape
             image_ids = self._latent_image_ids(lh // 2, lw // 2, latents.device)
             if self.teamwork_joint_attn:
-                # Build per-teammate (not per-component) image ids so the rotary
-                # embedding is batch-invariant and matches the (L_text + T*L_img)
-                # seq layout used by TeamworkFluxJointAttnProcessor.
-                image_ids_list = []
-                for teammate in range(sel.num_teammates):
-                    this_image_ids = image_ids.clone()
-                    this_image_ids[:, 0] += teammate
-                    image_ids_list.append(this_image_ids)
-                image_ids = torch.cat(image_ids_list, 0)
+                image_ids = self._joint_image_ids(image_ids, sel.num_teammates)
 
             # Get prompt embeds if needed
             if self.text_encoder is None:
@@ -198,9 +242,11 @@ class Flux2TeamworkPipeline(TeamworkPipeline, Flux2KleinPipeline):
         if extra is not None:
             model_latents = torch.cat([noisy_latents, extra], dim=1)
 
-        # Update selection
+        # Update selection (and the text length the single blocks split on)
         for adapter in adapter_modules(self.unwrapped_transformer).values():
             adapter.selection = sel
+            if isinstance(adapter, TeamworkFlux2SingleTransformerBlock):
+                adapter.text_seq_len = prompt_embeds.shape[1]
 
         # Account for extra channels in the rearrange
         total_channels = model_latents.shape[1]
@@ -290,15 +336,7 @@ class Flux2TeamworkPipeline(TeamworkPipeline, Flux2KleinPipeline):
         b, _, lh, lw = latents.shape
         image_ids = self._latent_image_ids(lh // 2, lw // 2, latents.device)
         if self.teamwork_joint_attn:
-            # Build per-teammate (not per-component) image ids so the rotary
-            # embedding is batch-invariant and matches the (L_text + T*L_img)
-            # seq layout used by TeamworkFluxJointAttnProcessor.
-            image_ids_list = []
-            for teammate in range(sel.num_teammates):
-                this_image_ids = image_ids.clone()
-                this_image_ids[:, 0] += teammate
-                image_ids_list.append(this_image_ids)
-            image_ids = torch.cat(image_ids_list, 0)
+            image_ids = self._joint_image_ids(image_ids, sel.num_teammates)
 
         # Get prompt embeds if needed
         if self.empty_prompt_embeds is not None:
@@ -328,9 +366,11 @@ class Flux2TeamworkPipeline(TeamworkPipeline, Flux2KleinPipeline):
         # Get extra channels if present
         extra = batch.packed_scaled_extra(1 / self.vae_scale_factor)
 
-        # Update selection
+        # Update selection (and the text length the single blocks split on)
         for adapter in adapter_modules(self.transformer).values():
             adapter.selection = sel
+            if isinstance(adapter, TeamworkFlux2SingleTransformerBlock):
+                adapter.text_seq_len = prompt_embeds.shape[1]
 
         # Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -417,6 +457,91 @@ TEAMWORK_PROFILES["FLUX2"] = [
     "single_transformer_blocks.*.attn.to_out",
 ]
 
-# TODO(joint-attn revision): add TEAMWORK_PROFILES["FLUX2_PLUSATTN"] once the
-# cross-teammate joint attention (Flux2Attention + parallel single block with
-# fused QKV/MLP) is implemented in attn.py.
+class TeamworkFlux2SingleTransformerBlock(Flux2SingleTransformerBlock, AdapterMixin):
+    """Teamwork-enabled Flux2 single (parallel) block.
+
+    Flux2's single block fuses QKV+MLP-in into one projection (`attn.to_qkv_mlp_proj`)
+    and attn-out+MLP-out into another (`attn.to_out`), and the transformer hands it
+    the full `[text, image]` sequence (text first) with `encoder_hidden_states=None`.
+    To do cross-teammate attention we run the fused input projection per component,
+    split out the QKV portion, route it through the masked joint attention (text
+    pulled to per-batch, image scattered per teammate), run the SwiGLU MLP per
+    component, then recombine and run the fused output projection. The image-stream
+    modulation/gate/residual mirror the base block. `text_seq_len` is threaded in by
+    the pipeline since the concatenated stream doesn't carry the split point.
+    """
+
+    def __init__(self, base: Flux2SingleTransformerBlock, cfg: TeamworkConfig):
+        shallowcopy_into(self, base)
+        self.adapter = nn.Parameter(torch.tensor(0.0))
+        self.text_seq_len: int | None = None
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor | None,
+        temb_mod: torch.Tensor,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        joint_attention_kwargs: dict[str, Any] | None = None,
+        split_hidden_states: bool = False,
+        text_seq_len: int | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        sel = self.selection
+        assert sel is not None
+        attn = self.attn
+
+        # In the single stack the transformer concatenates text+image and passes
+        # encoder_hidden_states=None; recover the split point either way.
+        if encoder_hidden_states is not None:
+            text_seq_len = encoder_hidden_states.shape[1]
+            hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+        if text_seq_len is None:
+            text_seq_len = self.text_seq_len
+        assert text_seq_len is not None, "text_seq_len must be threaded in by the pipeline"
+
+        mod_shift, mod_scale, mod_gate = Flux2Modulation.split(temb_mod, 1)[0]
+
+        residual = hidden_states
+        norm_hidden_states = self.norm(hidden_states)
+        norm_hidden_states = (1 + mod_scale) * norm_hidden_states + mod_shift
+
+        # Fused QKV + MLP-in projection (per-component LoRA), then split.
+        proj = attn.to_qkv_mlp_proj(norm_hidden_states)
+        qkv, mlp_hidden_states = torch.split(
+            proj, [3 * attn.inner_dim, attn.mlp_hidden_dim * attn.mlp_mult_factor], dim=-1
+        )
+        query, key, value = qkv.chunk(3, dim=-1)
+        query = attn.norm_q(query.unflatten(-1, (attn.heads, -1)))
+        key = attn.norm_k(key.unflatten(-1, (attn.heads, -1)))
+        value = value.unflatten(-1, (attn.heads, -1))
+
+        # Split text/image along the sequence; text shares norm_q/norm_k with image.
+        txt_q, img_q = query[:, :text_seq_len], query[:, text_seq_len:]
+        txt_k, img_k = key[:, :text_seq_len], key[:, text_seq_len:]
+        txt_v, img_v = value[:, :text_seq_len], value[:, text_seq_len:]
+
+        img_out, txt_out = teamwork_joint_attention(
+            img_q, img_k, img_v,
+            txt_q, txt_k, txt_v,
+            sel, image_rotary_emb,
+        )
+        attn_output = torch.cat([txt_out, img_out], dim=1).flatten(-2, -1).to(query.dtype)
+
+        # SwiGLU MLP per component, then fused output projection.
+        mlp_hidden_states = attn.mlp_act_fn(mlp_hidden_states)
+        attn_output = attn.to_out(torch.cat([attn_output, mlp_hidden_states], dim=-1))
+
+        hidden_states = residual + mod_gate * attn_output
+        if hidden_states.dtype == torch.float16:
+            hidden_states = hidden_states.clip(-65504, 65504)
+
+        if split_hidden_states:
+            return hidden_states[:, :text_seq_len], hidden_states[:, text_seq_len:]
+        return hidden_states
+
+
+TEAMWORK_PROFILES["FLUX2_PLUSATTN"] = [
+    *TEAMWORK_PROFILES["FLUX2"],
+    ("transformer_blocks.*.attn", Flux2TeamworkJointAttention),
+    ("single_transformer_blocks.*", TeamworkFlux2SingleTransformerBlock),
+]
