@@ -9,10 +9,12 @@ from diffusers.models.attention_processor import (
     FluxAttnProcessor2_0,
 )
 from diffusers.models.transformers.transformer_flux import FluxAttention, FluxAttnProcessor
+from diffusers.models.transformers.transformer_flux2 import Flux2Attention
 from diffusers.models.embeddings import apply_rotary_emb
 from einops import rearrange
 
 from .adapter import AdapterMixin, TeamworkConfig, shallowcopy_into
+from .batch import Selection
 
 
 def _teammate_block_mask(
@@ -461,4 +463,98 @@ class FluxTeamworkJointAttention(FluxAttention, AdapterMixin):
         shallowcopy_into(self, base)
         self.adapter = nn.Parameter(torch.tensor(0.0))
         self.set_processor(TeamworkFluxJointAttnProcessor()) # type: ignore
+
+
+def teamwork_joint_attention(
+    img_query: Tensor,  # (Tc, L_img, H, F) per component, head-split and normed
+    img_key: Tensor,
+    img_value: Tensor,
+    txt_query: Tensor,  # (Tc, L_text, H, F) per component, head-split and normed
+    txt_key: Tensor,
+    txt_value: Tensor,
+    sel: "Selection",
+    image_rotary_emb: tuple[Tensor, Tensor] | None,
+) -> tuple[Tensor, Tensor]:
+    """
+    Cross-teammate masked attention shared by the Flux/Flux2 joint-attention paths.
+
+    Text is per-batch: each component carries a (LoRA-perturbed) copy of the same
+    prompt, so we take the first component per batch as the canonical text and
+    broadcast the text output back to every component. Image queries/keys/values
+    are per-component and scattered into the dense (B, L_text + T*L_img) layout by
+    `_masked_attention_impl`. Returns (img_out, txt_out), both per-component:
+    img_out is (Tc, L_img, H, F) and txt_out is (Tc, L_text, H, F).
+    """
+    fcb = sel.first_component_per_batch
+    img_out, txt_out = _masked_attention_impl(
+        img_query, img_key, img_value,
+        txt_query[fcb], txt_key[fcb], txt_value[fcb],
+        image_rotary_emb,
+        sel.batch_indices,
+        sel.teammate_indices,
+        sel.present_matrix,
+        sel.attn_keep,
+    )
+    # Broadcast per-batch text output back to per-component.
+    txt_out = txt_out[sel.batch_indices]
+    return img_out, txt_out
+
+
+class TeamworkFlux2AttnProcessor:
+    """Cross-teammate joint attention for the Flux2 double-stream block.
+
+    Mirrors diffusers' Flux2AttnProcessor (separate image `to_*` and text
+    `add_*_proj` projections, separate qk-norms) but routes attention through the
+    masked teammate path. Rotary is applied inside `_masked_attention_impl`.
+    """
+
+    def __call__(
+        self,
+        attn: "Flux2TeamworkJointAttention",
+        hidden_states: Tensor,            # image, (Tc, L_img, dim)
+        encoder_hidden_states: Tensor,    # text, (Tc, L_text, dim)
+        attention_mask: Tensor | None = None,
+        image_rotary_emb: tuple[Tensor, Tensor] | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        assert encoder_hidden_states is not None
+        assert attention_mask is None, (
+            "TeamworkFlux2AttnProcessor masks via the BlockMask (present + attn_keep); "
+            "external attention_mask is not supported"
+        )
+        sel = attn.selection
+        assert sel is not None
+
+        query = attn.to_q(hidden_states).unflatten(-1, (attn.heads, -1))
+        key = attn.to_k(hidden_states).unflatten(-1, (attn.heads, -1))
+        value = attn.to_v(hidden_states).unflatten(-1, (attn.heads, -1))
+        encoder_query = attn.add_q_proj(encoder_hidden_states).unflatten(-1, (attn.heads, -1))
+        encoder_key = attn.add_k_proj(encoder_hidden_states).unflatten(-1, (attn.heads, -1))
+        encoder_value = attn.add_v_proj(encoder_hidden_states).unflatten(-1, (attn.heads, -1))
+
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
+        encoder_query = attn.norm_added_q(encoder_query)
+        encoder_key = attn.norm_added_k(encoder_key)
+
+        img_out, txt_out = teamwork_joint_attention(
+            query, key, value,
+            encoder_query, encoder_key, encoder_value,
+            sel, image_rotary_emb,
+        )
+
+        img_out = img_out.flatten(-2, -1).to(query.dtype)
+        txt_out = txt_out.flatten(-2, -1).to(query.dtype)
+
+        img_out = attn.to_out[0](img_out)
+        img_out = attn.to_out[1](img_out)
+        txt_out = attn.to_add_out(txt_out)
+
+        return img_out, txt_out
+
+
+class Flux2TeamworkJointAttention(Flux2Attention, AdapterMixin):
+    def __init__(self, base: "Flux2Attention", cfg: TeamworkConfig):
+        shallowcopy_into(self, base)
+        self.adapter = nn.Parameter(torch.tensor(0.0))
+        self.set_processor(TeamworkFlux2AttnProcessor())  # type: ignore
 
