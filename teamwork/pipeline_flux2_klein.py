@@ -26,32 +26,6 @@ from .batch import BatchBuilder, OutputImageType
 from .attn import Flux2TeamworkJointAttention, teamwork_joint_attention
 
 
-# Flux2 assigns reference/conditioning images RoPE T-coords of 10, 20, ... (see
-# Flux2KleinPipeline._prepare_image_ids, scale=10) while the generated image is
-# T=0. Teamwork mirrors this so zero-LoRA joint attention reduces to base editing.
-KLEIN_IMAGE_ID_SCALE = 10
-
-
-def klein_teammate_t_offsets(teammates: list[str]) -> list[int]:
-    """RoPE T-coord offset per teammate for the joint-attention layout.
-
-    Output teammates (``*.out``, the images being generated) sit at T=0, matching
-    the base model's denoised image. Input teammates (``*.in``, references/
-    conditioning) are placed at T=10, 20, ... in list order, matching klein's
-    reference-image convention. Assumes a single generated stream (multiple
-    ``.out`` teammates would all share T=0, which klein was not trained on).
-    """
-    offsets = []
-    ref_rank = 0
-    for name in teammates:
-        if name.endswith(".out"):
-            offsets.append(0)
-        else:
-            ref_rank += 1
-            offsets.append(ref_rank * KLEIN_IMAGE_ID_SCALE)
-    return offsets
-
-
 class Flux2TeamworkPipeline(TeamworkPipeline, Flux2KleinPipeline):
     teamwork_config: TeamworkConfig
     timestep_weight: str = "unit"
@@ -153,15 +127,14 @@ class Flux2TeamworkPipeline(TeamworkPipeline, Flux2KleinPipeline):
     def _joint_image_ids(self, image_ids: Tensor, num_teammates: int) -> Tensor:
         """Per-teammate image ids for the (L_text + T*L_img) joint-attention layout.
 
-        Each teammate's image gets its own RoPE T-coord so that, with zero LoRA,
-        the layout matches the base klein editing model: generated (output)
-        teammates sit at T=0 and reference (input) teammates at T=10, 20, ...
-        (Flux2's `_prepare_image_ids` scale), which is where klein was trained to
-        find conditioning images. Using naive offsets (0, 1, 2, ...) puts the
-        reference adjacent to the generation and yields garbage at init -- see
-        scripts/test_edit_parity.py.
+        Each teammate's image gets its own RoPE T-coord from the config's
+        `teammate_image_ids` so that, with zero LoRA, the layout matches the base
+        klein editing model (generated images at T=0, references at T=10, 20, ...).
+        Naive offsets (0, 1, 2, ...) put a reference adjacent to the generation and
+        yield garbage at init -- see scripts/test_edit_parity.py.
         """
-        offsets = klein_teammate_t_offsets(self.teamwork_config.teammates)
+        offsets = self.teamwork_config.teammate_image_ids
+        assert offsets is not None  # resolved in TeamworkConfig.__post_init__
         parts = []
         for t in range(num_teammates):
             ids = image_ids.clone()

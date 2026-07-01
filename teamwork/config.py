@@ -38,6 +38,22 @@ def parse_attn_allow(s: str, num_teammates: int) -> list[list[bool]]:
     return matrix
 
 
+def default_teammate_image_ids(profile: str | None, num_teammates: int) -> list[int]:
+    """Default per-teammate RoPE image-id T-offset for the joint-attention layout.
+
+    Without a joint-attention (``*PLUSATTN``) profile these offsets are unused, so
+    keep every teammate aligned at 0. ``FLUX2_PLUSATTN`` mirrors klein's
+    reference-image convention (T = 0, 10, 20, ... via Flux2 ``_prepare_image_ids``
+    scale) so zero-LoRA joint attention reduces to base editing; other joint
+    profiles use distinct adjacent coords (0, 1, 2, ...).
+    """
+    if profile is None or "PLUSATTN" not in profile:
+        return [0] * num_teammates
+    if profile == "FLUX2_PLUSATTN":
+        return list(range(0, 10 * num_teammates, 10))
+    return list(range(num_teammates))
+
+
 @dataclass(frozen=True)
 class TeamworkConfig:
     """
@@ -52,6 +68,11 @@ class TeamworkConfig:
         attn_allow: row-major bool matrix (e.g. ``"100;011;011"``) of allowed cross-teammate
             attention edges, or None for "all allowed". Diagonal must be ``1``. Combined
             multiplicatively with attention dropout to produce the runtime ``attn_keep``.
+        teammate_image_ids: per-teammate RoPE image-id T-offset used to place each
+            teammate's image tokens in the joint-attention layout. One int per teammate.
+            Defaults (resolved at construction and stored in the checkpoint) come from
+            ``default_teammate_image_ids``; set explicitly to control which teammates act
+            as generated (T=0) vs reference (T>0) images for models like klein.
 
     General Attributes:
         base_model: The checkpoint or model name from which the adapter was or will be trained
@@ -70,6 +91,7 @@ class TeamworkConfig:
     lora_communication: bool = True
     use_bias: bool = True
     attn_allow: str | None = None
+    teammate_image_ids: list[int] | None = None
 
     def __post_init__(self):
         for teammate in self.teammates:
@@ -77,6 +99,19 @@ class TeamworkConfig:
                 raise ValueError(f"{teammate} does not match {TEAMMATE_FMT}")
         if self.attn_allow is not None:
             parse_attn_allow(self.attn_allow, len(self.teammates))
+        # Resolve the default eagerly so the concrete list is stored in the
+        # checkpoint (frozen dataclass, so set via object.__setattr__).
+        if self.teammate_image_ids is None:
+            object.__setattr__(
+                self,
+                "teammate_image_ids",
+                default_teammate_image_ids(self.profile, len(self.teammates)),
+            )
+        elif len(self.teammate_image_ids) != len(self.teammates):
+            raise ValueError(
+                f"teammate_image_ids must have one entry per teammate "
+                f"({len(self.teammates)}), got {len(self.teammate_image_ids)}"
+            )
 
 
 def config_to_metadata(cfg: TeamworkConfig) -> dict[str, str]:
@@ -97,6 +132,8 @@ def config_to_metadata(cfg: TeamworkConfig) -> dict[str, str]:
             pass
         elif k == "teammates":
             metadata["teamwork.teammates"] = ",".join(v)
+        elif k == "teammate_image_ids":
+            metadata["teamwork.teammate_image_ids"] = ",".join(str(x) for x in v)
         elif v is not None:
             metadata[f"teamwork.{k}"] = str(v)
     return metadata
@@ -118,6 +155,8 @@ def metadata_to_config(metadata: dict[str, str]) -> TeamworkConfig:
                 continue
             if k == "teammates":
                 cfg_dict[k] = v.split(",")
+            elif k == "teammate_image_ids":
+                cfg_dict[k] = [int(x) for x in v.split(",")] if v else []
             elif k == "lora_rank":
                 cfg_dict[k] = int(v)
             elif k in ["lora_communication", "use_bias"]:

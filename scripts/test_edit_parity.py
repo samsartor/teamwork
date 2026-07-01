@@ -29,7 +29,7 @@ from diffusers.models.transformers.transformer_flux2 import Flux2Transformer2DMo
 from teamwork.config import TeamworkConfig
 from teamwork.adapter import adapt, adapter_modules
 from teamwork.batch import Selection
-from teamwork.pipeline_flux2_klein import klein_teammate_t_offsets  # registers FLUX2 / FLUX2_PLUSATTN
+import teamwork.pipeline_flux2_klein  # noqa: F401  registers FLUX2 / FLUX2_PLUSATTN
 
 REPO = "black-forest-labs/FLUX.2-klein-4B"  # same architecture as 9B, faster to load
 IN_CHANNELS = 128
@@ -155,9 +155,9 @@ def main():
         tol = 1e-3 * max(scale, 1.0)
         print(f"base editing prediction scale = {scale:.3e}; tol = {tol:.2e}\n")
 
-        # The pipeline's role-based offsets are the real regression gate; the naive
+        # The config's resolved offsets are the real regression gate; the naive
         # (0, 1, ...) offsets are kept to document why they don't work.
-        pipeline_offsets = klein_teammate_t_offsets(cfg.teammates)
+        pipeline_offsets = cfg.teammate_image_ids
         cases = [
             ([0, 1], "naive (0, 1)"),
             (pipeline_offsets, f"pipeline {tuple(pipeline_offsets)}"),
