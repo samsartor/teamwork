@@ -1865,7 +1865,7 @@ train = [
 [package.metadata]
 requires-dist = [
     { name = "accelerate", marker = "extra == 'diffusers'" },
-    { name = "diffusers", marker = "extra == 'diffusers'", specifier = "==0.37.1" },
+    { name = "diffusers", marker = "extra == 'diffusers'", specifier = ">=0.37.1" },
     { name = "einops" },
     { name = "gfxds", marker = "extra == 'train'" },
     { name = "gguf", marker = "extra == 'diffusers'" },
