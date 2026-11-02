@@ -207,6 +207,10 @@ def automatic_pipeline(base: Any, config: TeamworkConfig) -> type[TeamworkPipeli
         from .pipeline_flux2_klein import BatchFlux2KleinPipeline, SequenceFlux2KleinPipeline
 
         return SequenceFlux2KleinPipeline if sequence else BatchFlux2KleinPipeline
+    if base_type.__name__ == "QwenImage21Pipeline":
+        from .pipeline_qwenimage21 import BatchQwenImage21Pipeline, SequenceQwenImage21Pipeline
+
+        return SequenceQwenImage21Pipeline if sequence else BatchQwenImage21Pipeline
     raise NotImplementedError(
         f"automatic teamwork pipeline for {base_type} ({config.base_model})"
     )

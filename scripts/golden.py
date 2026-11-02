@@ -13,7 +13,9 @@ weights), adapts it with a non-zero random teamwork LoRA (random `down`, `up`, a
 Batches have B=2 with jagged presence (batch element 1 has no `mask.in`). Sequence-layout
 cases, where teammates attend to each other, also use a static `attn_allow` and attention
 dropout, so `attn_keep` gates attention in both `train_loss` and `__call__`. They run with
-the text adapted by `edited.out` and at base (`text_teammate` set and None).
+the text adapted by `edited.out` and at base (`text_teammate` set and None). Qwen cases
+inject precomputed VLM encodings (B=2, element 1's prompt right-padded) instead of running
+Qwen3-VL.
 
 Usage:
     python scripts/golden.py record [--goldens-dir scripts/goldens]
@@ -35,18 +37,22 @@ import diffusers.utils.logging
 
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from diffusers.models.autoencoders.autoencoder_kl_flux2 import AutoencoderKLFlux2
+from diffusers.models.autoencoders.autoencoder_kl_qwenimage21 import AutoencoderKLQwenImage21
 from diffusers.models.transformers.transformer_flux import FluxTransformer2DModel
 from diffusers.models.transformers.transformer_flux2 import Flux2Transformer2DModel
 from diffusers.models.transformers.transformer_sd3 import SD3Transformer2DModel
+from diffusers.models.transformers.transformer_qwenimage21 import QwenImage21Transformer2DModel
 from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
 from diffusers.pipelines.flux.pipeline_flux import FluxPipeline
 from diffusers.pipelines.flux2.pipeline_flux2_klein import Flux2KleinPipeline
+from diffusers.pipelines.qwenimage21.pipeline_qwenimage21 import QwenImage21Pipeline
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import StableDiffusionPipeline
 from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import StableDiffusion3Pipeline
 from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import StableDiffusionXLPipeline
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from diffusers.schedulers.scheduling_euler_discrete import EulerDiscreteScheduler
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
+from transformers import Qwen3VLProcessor
 
 from teamwork.adapter import adapter_parameters
 from teamwork.data import TeamBuilder
@@ -54,6 +60,8 @@ from teamwork.config import TeamworkConfig
 from teamwork.pipeline_flux import BatchFluxPipeline, SequenceFluxPipeline
 from teamwork.pipelines import TeamworkPipeline
 from teamwork.pipeline_flux2_klein import BatchFlux2KleinPipeline, SequenceFlux2KleinPipeline
+from teamwork.pipeline_qwenimage21 import BatchQwenImage21Pipeline, SequenceQwenImage21Pipeline
+from teamwork.family_qwen21 import QwenPrompt
 from teamwork.pipeline_sd2 import BatchSD2Pipeline
 from teamwork.pipeline_sd3 import BatchSD3Pipeline
 from teamwork.pipeline_sdxl import BatchSDXLPipeline
@@ -80,6 +88,10 @@ class Family:
     denoiser_attr: str  # "transformer" or "unet"
     prompt_embeds: dict[str, Callable[[torch.Generator], Tensor]]  # injected instead of text encoders
     sequence_cls: type[TeamworkPipeline] | None = None  # for `layout="sequence"` cases
+    resolution: int = RESOLUTION
+    # Extra `train_loss`/`__call__` kwargs for the B=2 batches (e.g. precomputed prompt encodings).
+    call_kwargs: Callable[[torch.Generator, torch.device], dict[str, Any]] | None = None
+    vlm_inputs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -298,6 +310,51 @@ def build_klein():
     )
 
 
+QWEN_RESOLUTION = 64  # Qwen's VAE downsamples 16x, and every VLM slot covers 2x2 latent tokens
+
+
+def build_qwen():
+    g = torch.Generator().manual_seed(15)
+    transformer = QwenImage21Transformer2DModel(
+        in_channels=8,
+        out_channels=8,
+        num_layers=2,
+        attention_head_dim=16,
+        num_attention_heads=2,
+        context_in_dim=TEXT_DIM,
+        axes_dims_rope=(4, 6, 6),
+    )
+    randomize_(transformer, g)
+    vae = AutoencoderKLQwenImage21(
+        base_dim=8, decoder_base_dim=8, z_dim=8, num_res_blocks=1,
+        latents_mean=[0.1 * i for i in range(8)], latents_std=[1.0 + 0.1 * i for i in range(8)],
+    )
+    randomize_(vae, g)
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained("Qwen/Qwen-Image-2.1", subfolder="scheduler")
+    assert isinstance(scheduler, FlowMatchEulerDiscreteScheduler)
+    return QwenImage21Pipeline(
+        # The scheduler config and the processor (tokenizer only; it builds the chat templates
+        # in __init__) come from the cached Qwen/Qwen-Image-2.1 repo; the text encoder is bypassed.
+        scheduler=scheduler,
+        vae=vae,
+        text_encoder=None,  # type: ignore
+        processor=Qwen3VLProcessor.from_pretrained("Qwen/Qwen-Image-2.1", subfolder="processor"),
+        transformer=transformer,
+    )
+
+
+def qwen_prompt(g: torch.Generator, device: torch.device) -> dict[str, Any]:
+    """B=2 VLM encodings: `[3 text][4 source slots][6 prompt]`, element 1's prompt 2 shorter (padded)."""
+    slots = (QWEN_RESOLUTION // 32) ** 2
+    S = 3 + slots + 6
+    image_pad = torch.zeros(S, dtype=torch.bool)
+    image_pad[3 : 3 + slots] = True
+    valid = torch.ones(2, S, dtype=torch.bool)
+    valid[1, S - 2 :] = False
+    hidden = torch.randn(2, S, TEXT_DIM, generator=g) * valid[..., None]
+    return {"prompt_embeds": QwenPrompt(hidden.to(device), valid.to(device), image_pad.to(device))}
+
+
 def embeds(g: torch.Generator) -> Tensor:
     return torch.randn(1, TEXT_LEN, TEXT_DIM, generator=g)
 
@@ -333,6 +390,13 @@ FAMILIES: dict[str, Family] = {
         },
         sequence_cls=SequenceFlux2KleinPipeline,
     ),
+    "qwen": Family(
+        BatchQwenImage21Pipeline, build_qwen, "transformer", {},
+        sequence_cls=SequenceQwenImage21Pipeline,
+        resolution=QWEN_RESOLUTION,
+        call_kwargs=qwen_prompt,
+        vlm_inputs=("source.in",),
+    ),
 }
 
 CASES: list[Case] = [
@@ -343,11 +407,12 @@ CASES: list[Case] = [
         ("sd3", "SD3"),
         ("flux", "FLUX"),
         ("klein", "FLUX2"),
+        ("qwen", "QWEN21"),
     ]
     for communicate in [True, False]
 ] + [Case("klein", "FLUX2", True, version="1.0")] + [
     Case(family, profile, communicate, layout="sequence", text_teammate=text_teammate)
-    for family, profile in [("flux", "FLUX"), ("klein", "FLUX2")]
+    for family, profile in [("flux", "FLUX"), ("klein", "FLUX2"), ("qwen", "QWEN21")]
     for communicate in [True, False]
     for text_teammate in ["edited.out", None]
 ]
@@ -370,6 +435,7 @@ def make_config(case: Case) -> TeamworkConfig:
         profile=case.profile,
         lora_communication=case.communicate,
         attn_allow=JOINT_ATTN_ALLOW if case.joint else None,
+        vlm_inputs=FAMILIES[case.family].vlm_inputs,
         **kwargs,
     )
 
@@ -414,10 +480,10 @@ def make_pipeline(case: Case, device: torch.device) -> tuple[Any, Family]:
     return pipe, family
 
 
-def fixed_images(seed: int) -> dict[str, Tensor]:
+def fixed_images(seed: int, resolution: int) -> dict[str, Tensor]:
     g = torch.Generator().manual_seed(seed)
     return {
-        name: torch.rand(3, RESOLUTION, RESOLUTION, generator=g) * 2 - 1
+        name: torch.rand(3, resolution, resolution, generator=g) * 2 - 1
         for name in ["edited", "source", "mask"]
     }
 
@@ -442,7 +508,8 @@ def run_case(case: Case, device: torch.device) -> tuple[dict[str, Tensor], dict[
 
     getattr(pipe, family.denoiser_attr).register_forward_hook(hook)
 
-    images = [fixed_images(1), fixed_images(2)]
+    images = [fixed_images(1, family.resolution), fixed_images(2, family.resolution)]
+    kwargs = {} if family.call_kwargs is None else family.call_kwargs(torch.Generator().manual_seed(5), device)
 
     # train_loss: element 0 has every teammate, element 1 is missing mask.in.
     # Like training, the output is provided first.
@@ -457,7 +524,7 @@ def run_case(case: Case, device: torch.device) -> tuple[dict[str, Tensor], dict[
         for name in present:
             batch.provide(name, images[batch_idx][name], batch_idx=batch_idx)
     g = torch.Generator().manual_seed(3)
-    latent_res = RESOLUTION // pipe.vae_scale_factor
+    latent_res = family.resolution // pipe.vae_scale_factor
     noise = torch.randn(batch.count, pipe.in_channels, latent_res, latent_res, generator=g).to(device)
     kept: list[Tensor | None] = []
     if case.layout == "sequence":
@@ -465,7 +532,7 @@ def run_case(case: Case, device: torch.device) -> tuple[dict[str, Tensor], dict[
         draw_attn_keep = batch.attn_keep
         batch.attn_keep = lambda: kept.append(draw_attn_keep()) or kept[-1]  # type: ignore[method-assign]
     try:
-        out = pipe.train_loss(batch, noise)
+        out = pipe.train_loss(batch, noise, **kwargs)
         for field in ["latents", "prediction", "target", "weight", "timestep_idx"]:
             value = getattr(out, field)
             if isinstance(value, Tensor):
@@ -492,7 +559,7 @@ def run_case(case: Case, device: torch.device) -> tuple[dict[str, Tensor], dict[
     g = torch.Generator().manual_seed(4)
     noise = torch.randn(batch.count, pipe.in_channels, latent_res, latent_res, generator=g).to(device)
     try:
-        outputs = pipe(call_images, noise=noise, num_inference_steps=NUM_STEPS, output_type="latents", batch=batch)
+        outputs = pipe(call_images, noise=noise, num_inference_steps=NUM_STEPS, output_type="latents", batch=batch, **kwargs)
         assert isinstance(outputs, list) and len(outputs) == 2
         for batch_idx, result in enumerate(outputs):
             assert set(result) == {"edited"}, result.keys()
