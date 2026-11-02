@@ -48,14 +48,15 @@ from diffusers.schedulers.scheduling_euler_discrete import EulerDiscreteSchedule
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 
 from teamwork.adapter import adapter_parameters
+from teamwork.attn import LegacyJointSelection
 from teamwork.data import TeamBuilder
 from teamwork.config import TeamworkConfig
-from teamwork.pipeline_flux import FluxTeamworkPipeline
+from teamwork.pipeline_flux import BatchFluxPipeline, LegacyJointFluxPipeline
 from teamwork.pipelines import TeamworkPipeline
-from teamwork.pipeline_flux2_klein import Flux2TeamworkPipeline
-from teamwork.pipeline_sd2 import StableDiffusion2TeamworkPipeline
-from teamwork.pipeline_sd3 import StableDiffusion3TeamworkPipeline
-from teamwork.pipeline_sdxl import StableDiffusionXLTeamworkPipeline
+from teamwork.pipeline_flux2_klein import BatchFlux2KleinPipeline, LegacyJointFlux2KleinPipeline
+from teamwork.pipeline_sd2 import BatchSD2Pipeline
+from teamwork.pipeline_sd3 import BatchSD3Pipeline
+from teamwork.pipeline_sdxl import BatchSDXLPipeline
 
 app = typer.Typer(pretty_exceptions_show_locals=False)
 diffusers.utils.logging.set_verbosity_error()
@@ -78,6 +79,7 @@ class Family:
     build_base: Callable[[], Any]  # tiny random diffusers base pipeline, fp32, on CPU
     denoiser_attr: str  # "transformer" or "unet"
     prompt_embeds: dict[str, Callable[[torch.Generator], Tensor]]  # injected instead of text encoders
+    legacy_joint_cls: type[TeamworkPipeline] | None = None  # for the `*_PLUSATTN` profiles
 
 
 @dataclass(frozen=True)
@@ -297,29 +299,31 @@ def pooled(g: torch.Generator) -> Tensor:
 
 
 FAMILIES: dict[str, Family] = {
-    "sd2": Family(StableDiffusion2TeamworkPipeline, build_sd2, "unet", {"empty_prompt_embeds": embeds}),
+    "sd2": Family(BatchSD2Pipeline, build_sd2, "unet", {"empty_prompt_embeds": embeds}),
     "sdxl": Family(
-        StableDiffusionXLTeamworkPipeline, build_sdxl, "unet",
+        BatchSDXLPipeline, build_sdxl, "unet",
         {"empty_prompt_embeds": embeds, "empty_pooled_prompt_embeds": pooled},
     ),
     "sd3": Family(
-        StableDiffusion3TeamworkPipeline, build_sd3, "transformer",
+        BatchSD3Pipeline, build_sd3, "transformer",
         {"empty_prompt_embeds": embeds, "empty_pooled_prompt_embeds": pooled},
     ),
     "flux": Family(
-        FluxTeamworkPipeline, build_flux, "transformer",
+        BatchFluxPipeline, build_flux, "transformer",
         {
             "empty_prompt_embeds": embeds,
             "empty_pooled_prompt_embeds": pooled,
             "empty_text_ids": lambda g: torch.zeros(TEXT_LEN, 3),
         },
+        legacy_joint_cls=LegacyJointFluxPipeline,
     ),
     "klein": Family(
-        Flux2TeamworkPipeline, build_klein, "transformer",
+        BatchFlux2KleinPipeline, build_klein, "transformer",
         {
             "empty_prompt_embeds": embeds,
             "empty_text_ids": lambda g: Flux2KleinPipeline._prepare_text_ids(torch.zeros(1, TEXT_LEN, TEXT_DIM)),
         },
+        legacy_joint_cls=LegacyJointFlux2KleinPipeline,
     ),
 }
 
@@ -383,10 +387,12 @@ def make_pipeline(case: Case, device: torch.device) -> tuple[Any, Family]:
     torch.manual_seed(0)  # anything left on the global RNG is per-case, not order-dependent
     base = family.build_base().to(device)
     cfg = make_config(case)
-    blank = family.pipeline_cls.from_base_pipeline(base, cfg)
+    pipeline_cls = family.legacy_joint_cls if case.joint else family.pipeline_cls
+    assert pipeline_cls is not None, f"{case.family} has no legacy joint-attention pipeline"
+    blank = pipeline_cls.from_base_pipeline(base, cfg)
     state = random_adapter_state(blank, family.denoiser_attr)
     del blank
-    pipe = family.pipeline_cls.from_base_pipeline(base, cfg, state=state)
+    pipe = pipeline_cls.from_base_pipeline(base, cfg, state=state)
     denoiser = getattr(pipe, family.denoiser_attr)
     loaded = adapter_parameters(denoiser)
     assert set(loaded) == set(state), f"loaded keys differ: {set(loaded) ^ set(state)}"
@@ -450,6 +456,7 @@ def run_case(case: Case, device: torch.device) -> tuple[dict[str, Tensor], dict[
                 tensors[f"loss/{field}"] = value.detach().clone()
         tensors["loss/loss"] = out.loss.detach().clone()
         if case.joint:
+            assert isinstance(out.selection, LegacyJointSelection)
             attn_keep = out.selection.attn_keep
             assert attn_keep is not None, "attention dropout should drop at least one edge"
             tensors["loss/attn_keep"] = attn_keep.to(torch.uint8)
@@ -475,7 +482,7 @@ def run_case(case: Case, device: torch.device) -> tuple[dict[str, Tensor], dict[
             assert set(result) == {"edited"}, result.keys()
             tensors[f"call/{batch_idx}/edited"] = result["edited"].detach().clone()
         if case.joint:
-            assert batch.selection().attn_keep is not None, "attn_allow should gate attention"
+            assert LegacyJointSelection.from_builder(batch).attn_keep is not None, "attn_allow should gate attention"
     except Exception as e:
         errors["call"] = f"{type(e).__name__}: {e}"
 

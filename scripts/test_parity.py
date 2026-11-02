@@ -25,9 +25,9 @@ Run from the repo root:
 import sys
 import torch
 
-from teamwork.config import TeamworkConfig
+from teamwork.config import TeamworkConfig, is_joint_attention_profile
 from teamwork.adapter import adapt, adapter_modules, TEAMWORK_PROFILES
-from teamwork.data import Selection
+from teamwork.attn import LegacyJointSelection
 
 # Importing the pipeline modules registers their TEAMWORK_PROFILES. Guard the
 # Klein import so a half-finished Klein port doesn't block the Flux1 cases.
@@ -39,14 +39,14 @@ except Exception as e:  # pragma: no cover - while the port is in progress
 
 
 def single_batch_selection(teammate_indices, num_teammates, device):
-    """Build a Selection for one logical batch element with the given teammates
-    (one component per teammate, all present, no attn gating)."""
+    """Build a selection for one logical batch element with the given teammates
+    (one component per teammate, all present, no attn gating). The legacy joint
+    selection also serves the batch adapters, which read only its batch fields."""
     n = len(teammate_indices)
     batch_matrix = torch.ones(n, 1, dtype=torch.bool, device=device)
     present_matrix = torch.zeros(1, num_teammates, dtype=torch.bool, device=device)
     present_matrix[0, teammate_indices] = True
-    return Selection(
-        enabled=True,
+    return LegacyJointSelection(
         teammate_indices=torch.tensor(teammate_indices, dtype=torch.int64, device=device),
         input_subindices=torch.empty(0, dtype=torch.int64, device=device),
         output_subindices=torch.arange(n, dtype=torch.int64, device=device),
@@ -164,12 +164,15 @@ def run_case(name, device, base_dtype, h=16, w=16, txt_len=32):
     base = load_transformer(case, device, dtype)
     base.eval()
 
+    joint = is_joint_attention_profile(case["profile"])
     cfg = TeamworkConfig(
         teammates=case["teammates"],
         lora_rank=8,
         base_model=case["repo"],
         title="parity-test",
         profile=case["profile"],
+        layout="sequence" if joint else "batch",
+        text_teammate=case["teammates"][0] if joint else None,
     )
     adapted = adapt(base, cfg, device=device, dtype=dtype, requires_grad=False)
     adapted.eval()

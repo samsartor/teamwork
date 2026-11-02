@@ -48,7 +48,7 @@ def teamwork_edit(pipe, cfg: TeamworkConfig, src: Image.Image, edit_noise: torch
 
 def case_klein() -> bool:
     from diffusers import Flux2KleinPipeline
-    from teamwork.pipeline_flux2_klein import Flux2TeamworkPipeline
+    from teamwork.pipeline_flux2_klein import LegacyJointFlux2KleinPipeline
 
     repo, steps, res = "black-forest-labs/FLUX.2-klein-9B", 4, 512
     base = Flux2KleinPipeline.from_pretrained(repo, torch_dtype=torch.bfloat16).to("cuda")
@@ -59,9 +59,10 @@ def case_klein() -> bool:
     ref = base(image=src, prompt=PROMPT, num_inference_steps=steps, guidance_scale=1.0, latents=base_noise).images[0]
 
     cfg = TeamworkConfig(
-        teammates=["edited.out", "source.in"], lora_rank=4, base_model=repo, title="parity", profile="FLUX2_PLUSATTN"
+        teammates=["edited.out", "source.in"], lora_rank=4, base_model=repo, title="parity", profile="FLUX2_PLUSATTN",
+        layout="sequence", text_teammate="edited.out",
     )
-    pipe = Flux2TeamworkPipeline.from_base_pipeline(base, cfg)
+    pipe = LegacyJointFlux2KleinPipeline.from_base_pipeline(base, cfg)
     value = psnr(teamwork_edit(pipe, cfg, src, edit_noise, num_inference_steps=steps), ref)
     ok = value >= MIN_PSNR
     print(f"[{'PASS' if ok else 'FAIL'}] klein: zero-LoRA teamwork vs base editing PSNR = {value:.1f} dB")

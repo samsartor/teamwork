@@ -28,7 +28,7 @@ from diffusers.models.transformers.transformer_flux2 import Flux2Transformer2DMo
 
 from teamwork.config import TeamworkConfig
 from teamwork.adapter import adapt, adapter_modules
-from teamwork.data import Selection
+from teamwork.attn import LegacyJointSelection
 import teamwork.pipeline_flux2_klein  # noqa: F401  registers FLUX2 / FLUX2_PLUSATTN
 
 REPO = "black-forest-labs/FLUX.2-klein-4B"  # same architecture as 9B, faster to load
@@ -83,8 +83,7 @@ def teamwork_edit_prediction(adapted, gen, ref, text, hh, ww, offsets, device):
     hidden = torch.stack([ref.squeeze(0), gen.squeeze(0)], dim=0)  # (2, L_img, C)
     teammate_indices = [1, 0]
 
-    sel = Selection(
-        enabled=True,
+    sel = LegacyJointSelection(
         teammate_indices=torch.tensor(teammate_indices, dtype=torch.int64, device=device),
         input_subindices=torch.tensor([0], dtype=torch.int64, device=device),
         output_subindices=torch.tensor([1], dtype=torch.int64, device=device),
@@ -137,6 +136,7 @@ def main():
     cfg = TeamworkConfig(
         teammates=["edited.out", "source.in"], lora_rank=8,
         base_model=REPO, title="edit-parity", profile="FLUX2_PLUSATTN",
+        layout="sequence", text_teammate="edited.out",
     )
     adapted = adapt(base, cfg, device=device, dtype=dtype, requires_grad=False).eval()
     for m in adapter_modules(adapted).values():

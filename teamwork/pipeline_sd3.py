@@ -11,13 +11,15 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
 
 from .pipelines import TeamworkPipeline, LossOutput
 from .config import TeamworkConfig
-from .adapter import adapt, TEAMWORK_PROFILES, Adapt, adapter_modules
+from .adapter import adapt, TEAMWORK_PROFILES, Adapt, set_selection
 from .checkpoint import save_adapters
 from .data import TeamBuilder, OutputImageType
-from .attn import TeamworkJointAttention
+from .batch_linear import BatchSelection
+from .sampling import sample_timestep_u, flow_match_noising
+from . import family_sd3
 
 
-class StableDiffusion3TeamworkPipeline(TeamworkPipeline, StableDiffusion3Pipeline):
+class BatchSD3Pipeline(TeamworkPipeline, StableDiffusion3Pipeline):
     teamwork_config: TeamworkConfig
     timestep_weight: str = "sigma_sqrt"
     empty_prompt_embeds: None | Tensor = None
@@ -34,6 +36,7 @@ class StableDiffusion3TeamworkPipeline(TeamworkPipeline, StableDiffusion3Pipelin
         training: bool = False,
         grad_checkpointing: bool = True,
     ):
+        cls.check_layout(teamwork_config)
         pipeline = cls(**base_pipeline.components)  # type: ignore
         pipeline.teamwork_config = teamwork_config
         pipeline.transformer = adapt(
@@ -60,20 +63,10 @@ class StableDiffusion3TeamworkPipeline(TeamworkPipeline, StableDiffusion3Pipelin
         pass
 
     def vae_encode(self, x: Tensor) -> Tensor:
-        x = x.to(self.vae.device, self.vae.dtype)
-        x = self.vae.encode(x).latent_dist.sample()  # type: ignore
-        x = (x - (self.vae.config.get("shift_factor", None) or 0)) * self.vae.config[
-            "scaling_factor"
-        ]
-        return x
+        return family_sd3.vae_encode(self.vae, x)
 
     def vae_decode(self, x: Tensor) -> Tensor:
-        x = x / self.vae.config["scaling_factor"] + (
-            self.vae.config.get("shift_factor", None) or 0
-        )
-        x = x.to(self.vae.device, self.vae.dtype)
-        x = self.vae.decode(x, return_dict=False)[0]  # type: ignore
-        return x
+        return family_sd3.vae_decode(self.vae, x)
 
     @torch.no_grad
     def empty_prompts(self, device: torch.device | None = None):
@@ -111,59 +104,21 @@ class StableDiffusion3TeamworkPipeline(TeamworkPipeline, StableDiffusion3Pipelin
         assert isinstance(train_scheduler, FlowMatchEulerDiscreteScheduler)
 
         with torch.no_grad():
-            if self.timestep_weight == "unit" or self.timestep_weight == "sigma_sqrt":
-                timestep_u = torch.rand([batch.batch_size])
-            elif self.timestep_weight == "logit_normal":
-                timestep_u = torch.nn.functional.sigmoid(torch.randn([batch.batch_size]))
-            else:
-                raise ValueError(f"Unknown timestep weight {self.timestep_weight}")
-
-            sel = batch.selection()
-            timestep_i = (timestep_u * len(train_scheduler.timesteps)).long()
-            timesteps = (
-                train_scheduler.timesteps[timestep_i][sel.batch_indices]
-                .to(device=self.device, dtype=self.dtype)
-            )
-
-            # Figure out how much noise to add to the latents
+            timestep_u = sample_timestep_u(self.timestep_weight, batch.batch_size)
+            sel = BatchSelection.from_components(batch.components_index())
             latents = batch.packed_encoded_images(
                 self.vae_encode,
                 self.transformer.config["in_channels"],
                 1 / self.vae_scale_factor,
             )
-            sigmas = train_scheduler.sigmas[timestep_i].to(
-                dtype=self.dtype, device=self.device
+            noising = flow_match_noising(
+                train_scheduler, timestep_u, sel, latents, noise, self.timestep_weight,
+                device=self.device, dtype=self.dtype,
             )
-            noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
-            if self.timestep_weight == "sigma_sqrt":
-                weighting = (sigmas**-2.0).float()
-            elif (
-                self.timestep_weight == "logit_normal" or self.timestep_weight == "unit"
-            ):
-                weighting = 1.0
-            else:
-                raise ValueError(f"Unknown timestep weight {self.timestep_weight}")
-
-            noisy_latents[sel.input_subindices] = latents[sel.input_subindices]
-
-            # Get prompt embeds if needed
-            if self.text_encoder is None:
-                assert self.empty_prompt_embeds is not None
-                assert self.empty_pooled_prompt_embeds is not None
-                prompt_embeds = self.empty_prompt_embeds.repeat(latents.shape[0], 1, 1)
-                pooled_prompt_embeds = self.empty_pooled_prompt_embeds.repeat(
-                    latents.shape[0], 1
-                )
-            else:
-                (prompt_embeds, _, pooled_prompt_embeds, _) = self.encode_prompt(
-                    prompt,
-                    prompt,
-                    prompt,
-                    num_images_per_prompt=latents.shape[0] if isinstance(prompt, str) else 1,
-                    do_classifier_free_guidance=False,
-                )
-            prompt_embeds = prompt_embeds.to(latents.dtype)
-            pooled_prompt_embeds = pooled_prompt_embeds.to(latents.dtype)
+            noisy_latents = noising.noisy_latents
+            prompt_embeds, pooled_prompt_embeds = family_sd3.encode_prompt(
+                self, prompt, latents.shape[0], latents.dtype,
+            )
 
         # Concatenate extra channels if present
         model_input = noisy_latents
@@ -171,26 +126,25 @@ class StableDiffusion3TeamworkPipeline(TeamworkPipeline, StableDiffusion3Pipelin
         if extra is not None:
             model_input = torch.cat([noisy_latents, extra], dim=1)
 
-        # Update selection
-        for adapter in adapter_modules(self.transformer).values():
-            adapter.selection = sel
+        set_selection(self.transformer, sel)
 
         if model is None:
             model = self.transformer
         model_pred = model(
             hidden_states=model_input,
-            timestep=timesteps,
+            timestep=noising.timesteps,
             encoder_hidden_states=prompt_embeds,
             pooled_projections=pooled_prompt_embeds,
         ).sample
-        latents_pred = model_pred * (-sigmas) + noisy_latents
+        latents_pred = model_pred * (-noising.sigmas) + noisy_latents
 
         return LossOutput(
+            selection=sel,
             latents=latents,
-            prediction=latents_pred[sel.output_subindices],
-            target=latents[sel.output_subindices],
-            weight=batch.packed_scaled_weights(1 / self.vae_scale_factor)[sel.output_subindices].unsqueeze(1) * weighting,
-            timestep_idx=timestep_i,
+            prediction=latents_pred,
+            target=latents,
+            weight=batch.packed_scaled_weights(1 / self.vae_scale_factor).unsqueeze(1) * noising.weighting,
+            timestep_idx=noising.timestep_idx,
             type='signal',
         )
 
@@ -223,7 +177,7 @@ class StableDiffusion3TeamworkPipeline(TeamworkPipeline, StableDiffusion3Pipelin
             )
 
         # Initialize latents
-        sel = batch.selection()
+        sel = BatchSelection.from_components(batch.components_index())
         clean_latents = batch.packed_encoded_images(
             self.vae_encode,
             self.transformer.config["in_channels"],
@@ -242,15 +196,7 @@ class StableDiffusion3TeamworkPipeline(TeamworkPipeline, StableDiffusion3Pipelin
         # Get prompt embeds if needed
         neg_embeds = None
         pooled_neg_embeds = None
-        if (
-            self.empty_prompt_embeds is not None
-            and self.empty_pooled_prompt_embeds is not None
-        ):
-            prompt_embeds = self.empty_prompt_embeds.repeat(latents.shape[0], 1, 1)
-            pooled_prompt_embeds = self.empty_pooled_prompt_embeds.repeat(
-                latents.shape[0], 1
-            )
-        elif guidance_scale > 1.0:
+        if self.empty_prompt_embeds is None and guidance_scale > 1.0:
             (prompt_embeds, neg_embeds, pooled_prompt_embeds, pooled_neg_embeds) = (
                 self.encode_prompt(
                     prompt,
@@ -261,16 +207,12 @@ class StableDiffusion3TeamworkPipeline(TeamworkPipeline, StableDiffusion3Pipelin
                     do_classifier_free_guidance=True,
                 )
             )
+            prompt_embeds = prompt_embeds.to(latents.dtype)
+            pooled_prompt_embeds = pooled_prompt_embeds.to(latents.dtype)
         else:
-            (prompt_embeds, _, pooled_prompt_embeds, _) = self.encode_prompt(
-                prompt,
-                prompt,
-                prompt,
-                num_images_per_prompt=latents.shape[0],
-                do_classifier_free_guidance=False,
+            prompt_embeds, pooled_prompt_embeds = family_sd3.encode_prompt(
+                self, prompt, latents.shape[0], latents.dtype,
             )
-        prompt_embeds = prompt_embeds.to(latents.dtype)
-        pooled_prompt_embeds = pooled_prompt_embeds.to(latents.dtype)
 
         # Set timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -279,9 +221,7 @@ class StableDiffusion3TeamworkPipeline(TeamworkPipeline, StableDiffusion3Pipelin
         # Get extra channels if present
         extra = batch.packed_scaled_extra(1 / self.vae_scale_factor)
 
-        # Update selection
-        for adapter in adapter_modules(self.transformer).values():
-            adapter.selection = sel
+        set_selection(self.transformer, sel)
 
         # Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -339,9 +279,4 @@ TEAMWORK_PROFILES["SD3"] = [
     "transformer_blocks.*.attn.to_out.0",
     "transformer_blocks.*.ff.net.0.proj",
     "transformer_blocks.*.ff.net.2",
-]
-
-TEAMWORK_PROFILES["SD3_PLUSATTN"] = [
-    *TEAMWORK_PROFILES["SD3"],
-    ("transformer_blocks.*.attn", TeamworkJointAttention),
 ]

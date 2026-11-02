@@ -6,14 +6,14 @@ from typing import Self, Any, Literal
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
-from .config import TeamworkConfig
+from .config import TeamworkConfig, Layout
 from .adapter import Adapt
 from .checkpoint import load_safetensors
-from .data import TeamBuilder, Selection
+from .data import TeamBuilder, Components
 
 @dataclass
 class LossOutput:
-    selection: Selection
+    selection: Components
     latents: Tensor
     prediction: Tensor
     target: Tensor
@@ -32,6 +32,15 @@ class LossOutput:
 
 class TeamworkPipeline(ABC):
     teamwork_config: TeamworkConfig
+    # The config layout this pipeline class implements, checked by `check_layout`.
+    layout: Layout = "batch"
+
+    @classmethod
+    def check_layout(cls, teamwork_config: TeamworkConfig):
+        assert teamwork_config.layout == cls.layout, (
+            f"{cls.__name__} implements the {cls.layout!r} layout, but the config has "
+            f"{teamwork_config.layout!r} (profile {teamwork_config.profile!r}); use automatic_pipeline"
+        )
 
     @classmethod
     def from_checkpoint(
@@ -174,36 +183,30 @@ class TeamworkPipeline(ABC):
 
 def automatic_pipeline(base: Any, config: TeamworkConfig) -> type[TeamworkPipeline]:
     base_type = type(base)
+    sequence = config.layout == "sequence"
     if "stable-diffusion-2" in config.base_model:
-        if config.profile is not None and "RGBX" in config.profile:
-            from .pipeline_rgbx import StableDiffusionRGB2XPipeline
+        assert not sequence, "SD2 only has the batch implementation"
+        from .pipeline_sd2 import BatchSD2Pipeline
 
-            return StableDiffusionRGB2XPipeline
-        else:
-            from .pipeline_sd2 import StableDiffusion2TeamworkPipeline
-
-            return StableDiffusion2TeamworkPipeline
+        return BatchSD2Pipeline
     if base_type.__name__ == "StableDiffusion3Pipeline":
-        if config.profile is not None and "RGBX" in config.profile:
-            from .pipeline_rgbx_sd3 import StableDiffusion3RGB2XPipeline
+        assert not sequence, "SD3 has no sequence implementation yet"
+        from .pipeline_sd3 import BatchSD3Pipeline
 
-            return StableDiffusion3RGB2XPipeline
-        else:
-            from .pipeline_sd3 import StableDiffusion3TeamworkPipeline
-
-            return StableDiffusion3TeamworkPipeline
+        return BatchSD3Pipeline
     if base_type.__name__ == "StableDiffusionXLPipeline":
-        from .pipeline_sdxl import StableDiffusionXLTeamworkPipeline
+        assert not sequence, "SDXL only has the batch implementation"
+        from .pipeline_sdxl import BatchSDXLPipeline
 
-        return StableDiffusionXLTeamworkPipeline
-    if base_type.__name__ == "FluxPipeline":
-        from .pipeline_flux import FluxTeamworkPipeline
+        return BatchSDXLPipeline
+    if base_type.__name__ in ("FluxPipeline", "FluxKontextPipeline"):
+        from .pipeline_flux import BatchFluxPipeline, LegacyJointFluxPipeline
 
-        return FluxTeamworkPipeline
+        return LegacyJointFluxPipeline if sequence else BatchFluxPipeline
     if base_type.__name__ == "Flux2KleinPipeline":
-        from .pipeline_flux2_klein import Flux2TeamworkPipeline
+        from .pipeline_flux2_klein import BatchFlux2KleinPipeline, LegacyJointFlux2KleinPipeline
 
-        return Flux2TeamworkPipeline
+        return LegacyJointFlux2KleinPipeline if sequence else BatchFlux2KleinPipeline
     raise NotImplementedError(
         f"automatic teamwork pipeline for {base_type} ({config.base_model})"
     )

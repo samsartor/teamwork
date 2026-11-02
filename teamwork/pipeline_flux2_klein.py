@@ -1,13 +1,7 @@
-
 import torch
-import torch.nn.functional as F
 from torch import Tensor, nn
 from typing import Any, Literal, Callable
-from diffusers.pipelines.flux2.pipeline_flux2_klein import (
-    Flux2KleinPipeline,
-    retrieve_timesteps,
-    compute_empirical_mu,
-)
+from diffusers.pipelines.flux2.pipeline_flux2_klein import Flux2KleinPipeline
 from diffusers.models.transformers.transformer_flux2 import (
     Flux2Transformer2DModel,
     Flux2SingleTransformerBlock,
@@ -16,23 +10,22 @@ from diffusers.models.transformers.transformer_flux2 import (
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
-from einops import rearrange, repeat
-import numpy as np
 
 from .pipelines import TeamworkPipeline, LossOutput
-from .config import TeamworkConfig
-from .adapter import adapt, TEAMWORK_PROFILES, Adapt, adapter_modules, shallowcopy_into, AdapterMixin
+from .config import TeamworkConfig, Layout
+from .adapter import adapt, TEAMWORK_PROFILES, Adapt, set_selection, shallowcopy_into, AdapterMixin
 from .checkpoint import save_adapters
 from .data import TeamBuilder, OutputImageType
-from .attn import Flux2TeamworkJointAttention, teamwork_joint_attention
+from .batch_linear import BatchSelection
+from .sampling import sample_timestep_u, flow_match_noising
+from . import family_flux2
 
 
-class Flux2TeamworkPipeline(TeamworkPipeline, Flux2KleinPipeline):
+class BatchFlux2KleinPipeline(TeamworkPipeline, Flux2KleinPipeline):
     teamwork_config: TeamworkConfig
     timestep_weight: str = "unit"
     empty_prompt_embeds: None | Tensor = None
     empty_text_ids: None | Tensor = None
-    teamwork_joint_attn = False
 
     @classmethod
     def from_base_pipeline(
@@ -44,6 +37,7 @@ class Flux2TeamworkPipeline(TeamworkPipeline, Flux2KleinPipeline):
         training: bool = False,
         grad_checkpointing: bool = True,
     ):
+        cls.check_layout(teamwork_config)
         pipeline = cls(**base_pipeline.components)  # type: ignore
         pipeline.teamwork_config = teamwork_config
         pipeline.transformer = adapt(
@@ -57,11 +51,6 @@ class Flux2TeamworkPipeline(TeamworkPipeline, Flux2KleinPipeline):
             infer_layers_from_state=False,
         )
         assert isinstance(pipeline.transformer, Flux2Transformer2DModel)
-        if isinstance(
-            pipeline.transformer.single_transformer_blocks[0],
-            TeamworkFlux2SingleTransformerBlock,
-        ):
-            pipeline.teamwork_joint_attn = True
         if training and grad_checkpointing:
             pipeline.transformer.enable_gradient_checkpointing()
         return pipeline
@@ -83,40 +72,21 @@ class Flux2TeamworkPipeline(TeamworkPipeline, Flux2KleinPipeline):
     def load_extra_metadata(self, metadata: dict[str, str]):
         pass
 
-    @property
-    def legacy_latents(self) -> bool:
-        """Version 1.0 checkpoints were trained on raw, sampled VAE latents."""
-        return self.teamwork_config.version == "1.0"
-
-    def _latent_bn_stats(self, lh: int, lw: int, x: Tensor) -> tuple[Tensor, Tensor]:
-        """The VAE's BN mean/std, laid out on the unpatchified (b, 32, lh, lw) grid.
-
-        Klein normalizes the 2x2-patchified latents with `vae.bn`, whose 128 channels are
-        ordered (c ph pw), matching Flux2KleinPipeline._patchify_latents and our packing.
-        """
-        bn = self.vae.bn
-        assert bn.running_mean is not None and bn.running_var is not None
-        std = torch.sqrt(bn.running_var + self.vae.config["batch_norm_eps"])
-        layout = "(c ph pw) -> 1 c (h ph) (w pw)"
-        mean = repeat(bn.running_mean, layout, ph=2, pw=2, h=lh // 2, w=lw // 2)
-        std = repeat(std, layout, ph=2, pw=2, h=lh // 2, w=lw // 2)
-        return mean.to(x.device, x.dtype), std.to(x.device, x.dtype)
-
     def vae_encode(self, x: Tensor) -> Tensor:
-        x = x.to(self.vae.device, self.vae.dtype)
-        if self.legacy_latents:
-            return self.vae.encode(x).latent_dist.sample()  # type: ignore
-        x = self.vae.encode(x).latent_dist.mode()  # type: ignore
-        mean, std = self._latent_bn_stats(x.shape[2], x.shape[3], x)
-        return (x - mean) / std
+        return family_flux2.vae_encode(self.vae, x, self.teamwork_config.version)
 
     def vae_decode(self, x: Tensor) -> Tensor:
-        x = x.to(self.vae.device, self.vae.dtype)
-        if not self.legacy_latents:
-            mean, std = self._latent_bn_stats(x.shape[2], x.shape[3], x)
-            x = x * std + mean
-        x = self.vae.decode(x, return_dict=False)[0]  # type: ignore
-        return x
+        return family_flux2.vae_decode(self.vae, x, self.teamwork_config.version)
+
+    def make_selection(self, batch: TeamBuilder) -> BatchSelection:
+        return BatchSelection.from_components(batch.components_index())
+
+    def image_ids(self, lh: int, lw: int, device: torch.device) -> Tensor:
+        """RoPE ids of the image tokens in each row: one image per row."""
+        return family_flux2.latent_image_ids(lh, lw, device)
+
+    def activate_adapters(self, model: nn.Module, sel: BatchSelection, text_seq_len: int):
+        set_selection(model, sel)
 
     @torch.no_grad
     def empty_prompts(self, device: torch.device | None = None):
@@ -133,35 +103,6 @@ class Flux2TeamworkPipeline(TeamworkPipeline, Flux2KleinPipeline):
         self.text_encoder = None
         self.tokenizer = None
 
-    def _latent_image_ids(self, hh: int, ww: int, device: torch.device) -> Tensor:
-        """4-axis (T, H, W, L) position ids for a packed latent grid of size (hh, ww).
-
-        Mirrors Flux2KleinPipeline._prepare_latent_ids for a single image: T and L
-        stay 0, H/W index the patch grid. Built in float32 so large grids stay exact.
-        """
-        ids = torch.zeros(hh * ww, 4, device=device, dtype=torch.float32)
-        ids[:, 1] = torch.arange(hh, device=device).repeat_interleave(ww)
-        ids[:, 2] = torch.arange(ww, device=device).repeat(hh)
-        return ids
-
-    def _joint_image_ids(self, image_ids: Tensor, num_teammates: int) -> Tensor:
-        """Per-teammate image ids for the (L_text + T*L_img) joint-attention layout.
-
-        Each teammate's image gets its own RoPE T-coord from the config's
-        `teammate_image_ids` so that, with zero LoRA, the layout matches the base
-        klein editing model (generated images at T=0, references at T=10, 20, ...).
-        Naive offsets (0, 1, 2, ...) put a reference adjacent to the generation and
-        yield garbage at init -- see scripts/test_edit_parity.py.
-        """
-        offsets = self.teamwork_config.teammate_image_ids
-        assert offsets is not None  # resolved in TeamworkConfig.__post_init__
-        parts = []
-        for t in range(num_teammates):
-            ids = image_ids.clone()
-            ids[:, 0] += offsets[t]
-            parts.append(ids)
-        return torch.cat(parts, 0)
-
     def train_loss(
         self,
         batch: TeamBuilder,
@@ -174,112 +115,45 @@ class Flux2TeamworkPipeline(TeamworkPipeline, Flux2KleinPipeline):
         assert isinstance(train_scheduler, FlowMatchEulerDiscreteScheduler)
 
         with torch.no_grad():
-            if self.timestep_weight == "unit" or self.timestep_weight == "sigma_sqrt":
-                timestep_u = torch.rand([batch.batch_size])
-            elif self.timestep_weight == "logit_normal":
-                timestep_u = torch.nn.functional.sigmoid(torch.randn([batch.batch_size]))
-            else:
-                raise ValueError(f"Unknown timestep weight {self.timestep_weight}")
-
-            sel = batch.selection()
-            timestep_u = timestep_u[sel.batch_indices.cpu()]
-            timestep_i = (timestep_u * len(train_scheduler.timesteps)).long()
-            timesteps = (
-                train_scheduler.timesteps[timestep_i]
-                .to(device=self.device, dtype=self.dtype)
-            )
-
-            # Flux2 Klein is guidance-distilled (guidance_embeds=False); no guidance input.
-            guidance = None
-
-            # Figure out how much noise to add to the latents
+            timestep_u = sample_timestep_u(self.timestep_weight, batch.batch_size)
+            sel = self.make_selection(batch)
             latents = batch.packed_encoded_images(
                 self.vae_encode, self.in_channels, 1 / self.vae_scale_factor
             )
-            sigmas = train_scheduler.sigmas[timestep_i].reshape(batch.count, 1, 1, 1).to(
-                dtype=self.dtype, device=self.device
+            noising = flow_match_noising(
+                train_scheduler, timestep_u, sel, latents, noise, self.timestep_weight,
+                device=self.device, dtype=self.dtype,
             )
-            noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
-            if self.timestep_weight == "sigma_sqrt":
-                weighting = (sigmas**-2.0).float()
-            elif (
-                self.timestep_weight == "logit_normal" or self.timestep_weight == "unit"
-            ):
-                weighting = 1.0
-            else:
-                raise ValueError(f"Unknown timestep weight {self.timestep_weight}")
 
-            noisy_latents[sel.input_subindices] = latents[sel.input_subindices]
-
-            b, _, lh, lw = latents.shape
-            image_ids = self._latent_image_ids(lh // 2, lw // 2, latents.device)
-            if self.teamwork_joint_attn:
-                image_ids = self._joint_image_ids(image_ids, sel.num_teammates)
-
-            # Get prompt embeds if needed
-            if self.text_encoder is None:
-                assert self.empty_prompt_embeds is not None
-                assert self.empty_text_ids is not None
-                prompt_embeds = self.empty_prompt_embeds.repeat(latents.shape[0], 1, 1)
-                text_ids = self.empty_text_ids
-            else:
-                (prompt_embeds, text_ids) = self.encode_prompt(
-                    prompt,
-                    num_images_per_prompt=latents.shape[0] if isinstance(prompt, str) else 1,
-                )
-            prompt_embeds = prompt_embeds.to(latents.dtype)
-            text_ids = text_ids.to(latents.dtype)
+            _, _, lh, lw = latents.shape
+            image_ids = self.image_ids(lh, lw, latents.device)
+            prompt_embeds, text_ids = family_flux2.encode_prompt(self, prompt, latents.shape[0], latents.dtype)
 
         # Concatenate extra channels if present
-        model_latents = noisy_latents
+        model_latents = noising.noisy_latents
         extra = batch.packed_scaled_extra(1 / self.vae_scale_factor)
         if extra is not None:
-            model_latents = torch.cat([noisy_latents, extra], dim=1)
+            model_latents = torch.cat([model_latents, extra], dim=1)
 
-        # Update selection (and the text length the single blocks split on)
-        for adapter in adapter_modules(self.unwrapped_transformer).values():
-            adapter.selection = sel
-            if isinstance(adapter, TeamworkFlux2SingleTransformerBlock):
-                adapter.text_seq_len = prompt_embeds.shape[1]
+        self.activate_adapters(self.unwrapped_transformer, sel, prompt_embeds.shape[1])
 
-        # Account for extra channels in the rearrange
-        total_channels = model_latents.shape[1]
-        model_input = rearrange(
-            model_latents,
-            "b c (h ph) (w pw) -> b (h w) (c ph pw)",
-            b=b,
-            c=total_channels,
-            w=lw // 2,
-            h=lh // 2,
-            ph=2,
-            pw=2,
-        )
         model_pred = self.transformer(
-            hidden_states=model_input,
-            timestep=timesteps / 1000,
-            guidance=guidance,
+            hidden_states=family_flux2.patchify(model_latents),
+            timestep=noising.timesteps / 1000,
+            guidance=None,  # Flux2 Klein is guidance-distilled (guidance_embeds=False)
             encoder_hidden_states=prompt_embeds,
             txt_ids=text_ids,
             img_ids=image_ids,
         ).sample
-        model_pred = rearrange(
-            model_pred,
-            "b (h w) (c ph pw) -> b c (h ph) (w pw)",
-            b=b,
-            c=self.in_channels,
-            w=lw // 2,
-            h=lh // 2,
-            ph=2,
-            pw=2,
-        )
+        model_pred = family_flux2.unpatchify(model_pred, self.in_channels, lh, lw)
 
         return LossOutput(
             selection=sel,
             latents=latents,
             prediction=model_pred,
             target=noise - latents,
-            weight=batch.packed_scaled_weights(1 / self.vae_scale_factor).unsqueeze(1) * weighting,
-            timestep_idx=timestep_i,
+            weight=batch.packed_scaled_weights(1 / self.vae_scale_factor).unsqueeze(1) * noising.weighting,
+            timestep_idx=noising.timestep_idx,
             type='signal',
         )
 
@@ -297,8 +171,12 @@ class Flux2TeamworkPipeline(TeamworkPipeline, Flux2KleinPipeline):
         width: int | None = None,
         output_type: OutputImageType = "pil",
         batch: TeamBuilder | None = None,
-        callback_on_step_end: Callable[[int, int, dict], None] | None = None,
+        callback_on_step_end: Callable[..., dict | None] | None = None,
     ) -> dict[str, Any]:
+        """
+        `callback_on_step_end(pipe, i, t, {'latents': (count, c, lh, lw), 'selection': Components})`
+        may return a dict with replacement `latents`.
+        """
         device = self._execution_device
         if batch is None:
             batch = TeamBuilder.from_inputs(
@@ -313,7 +191,7 @@ class Flux2TeamworkPipeline(TeamworkPipeline, Flux2KleinPipeline):
             )
 
         # Initialize latents
-        sel = batch.selection()
+        sel = self.make_selection(batch)
         clean_latents = batch.packed_encoded_images(
             self.vae_encode, self.in_channels, 1 / self.vae_scale_factor
         )
@@ -327,44 +205,18 @@ class Flux2TeamworkPipeline(TeamworkPipeline, Flux2KleinPipeline):
         else:
             latents = noise.to(device, self.dtype)
 
-        b, _, lh, lw = latents.shape
-        image_ids = self._latent_image_ids(lh // 2, lw // 2, latents.device)
-        if self.teamwork_joint_attn:
-            image_ids = self._joint_image_ids(image_ids, sel.num_teammates)
+        _, _, lh, lw = latents.shape
+        image_ids = self.image_ids(lh, lw, latents.device)
+        prompt_embeds, text_ids = family_flux2.encode_prompt(self, prompt, latents.shape[0], latents.dtype)
 
-        # Get prompt embeds if needed
-        if self.empty_prompt_embeds is not None:
-            assert self.empty_text_ids is not None
-            prompt_embeds = self.empty_prompt_embeds.repeat(latents.shape[0], 1, 1)
-            text_ids = self.empty_text_ids
-        else:
-            (prompt_embeds, text_ids) = self.encode_prompt(
-                prompt,
-                num_images_per_prompt=latents.shape[0],
-            )
-        prompt_embeds = prompt_embeds.to(latents.dtype)
-        text_ids = text_ids.to(latents.dtype)
-
-        # Set timesteps
-        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
-        image_seq_len = (lh // 2) * (lw // 2)  # packed tokens, not latent channels
-        mu = compute_empirical_mu(image_seq_len=image_seq_len, num_steps=num_inference_steps)
-        timesteps, num_inference_steps = retrieve_timesteps(
-            self.scheduler,
-            num_inference_steps,
-            device,
-            sigmas=sigmas,
-            mu=mu,
+        timesteps, num_inference_steps = family_flux2.inference_timesteps(
+            self.scheduler, num_inference_steps, (lh // 2) * (lw // 2), device,
         )
 
         # Get extra channels if present
         extra = batch.packed_scaled_extra(1 / self.vae_scale_factor)
 
-        # Update selection (and the text length the single blocks split on)
-        for adapter in adapter_modules(self.transformer).values():
-            adapter.selection = sel
-            if isinstance(adapter, TeamworkFlux2SingleTransformerBlock):
-                adapter.text_seq_len = prompt_embeds.shape[1]
+        self.activate_adapters(self.transformer, sel, prompt_embeds.shape[1])
 
         # Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -375,45 +227,19 @@ class Flux2TeamworkPipeline(TeamworkPipeline, Flux2KleinPipeline):
                 ]
                 timestep = t.expand(model_latents.shape[0])
 
-                # Flux2 Klein is guidance-distilled (guidance_embeds=False).
-                guidance = None
-
                 # Concatenate extra channels if present
                 if extra is not None:
                     model_latents = torch.cat([model_latents, extra], dim=1)
 
-                # Account for extra channels in the rearrange
-                total_channels = model_latents.shape[1]
-
-                # Get model pred
-                model_input = rearrange(
-                    model_latents,
-                    "b c (h ph) (w pw) -> b (h w) (c ph pw)",
-                    b=b,
-                    c=total_channels,
-                    w=lw // 2,
-                    h=lh // 2,
-                    ph=2,
-                    pw=2,
-                )
                 noise_pred = self.transformer(
-                    hidden_states=model_input,
+                    hidden_states=family_flux2.patchify(model_latents),
                     timestep=timestep / 1000,
-                    guidance=guidance,
+                    guidance=None,  # Flux2 Klein is guidance-distilled (guidance_embeds=False)
                     encoder_hidden_states=prompt_embeds,
                     txt_ids=text_ids,
                     img_ids=image_ids,
                 ).sample
-                noise_pred = rearrange(
-                    noise_pred,
-                    "b (h w) (c ph pw) -> b c (h ph) (w pw)",
-                    b=b,
-                    c=self.in_channels,
-                    w=lw // 2,
-                    h=lh // 2,
-                    ph=2,
-                    pw=2,
-                )
+                noise_pred = family_flux2.unpatchify(noise_pred, self.in_channels, lh, lw)
 
                 # Scheduler step
                 latents = self.scheduler.step(noise_pred, t, latents).prev_sample
@@ -451,7 +277,46 @@ TEAMWORK_PROFILES["FLUX2"] = [
     "single_transformer_blocks.*.attn.to_out",
 ]
 
-class TeamworkFlux2SingleTransformerBlock(Flux2SingleTransformerBlock, AdapterMixin):
+
+# ======================================================================================
+# LEGACY JOINT ATTENTION (`FLUX2_PLUSATTN`). Delete in phase 6, together with attn.py.
+#
+# Batch-axis everywhere except attention: every component keeps its own text copy, and
+# the joint processors in attn.py scatter the components of each batch element into one
+# dense sequence for attention. Replaced by the sequence-axis implementation.
+# ======================================================================================
+
+from .attn import Flux2TeamworkJointAttention, LegacyJointSelection, teamwork_joint_attention  # noqa: E402
+
+
+class LegacyJointFlux2KleinPipeline(BatchFlux2KleinPipeline):
+    layout: Layout = "sequence"
+
+    def make_selection(self, batch: TeamBuilder) -> LegacyJointSelection:
+        return LegacyJointSelection.from_builder(batch)
+
+    def image_ids(self, lh: int, lw: int, device: torch.device) -> Tensor:
+        """Per-teammate image ids for the (L_text + T*L_img) joint-attention layout.
+
+        Each teammate's image gets its own RoPE T-coord from the config's
+        `teammate_image_ids` so that, with zero LoRA, the layout matches the base
+        klein editing model (generated images at T=0, references at T=10, 20, ...).
+        Naive offsets (0, 1, 2, ...) put a reference adjacent to the generation and
+        yield garbage at init -- see scripts/test_edit_parity.py.
+        """
+        offsets = self.teamwork_config.teammate_image_ids
+        assert offsets is not None  # resolved in TeamworkConfig.__post_init__
+        return family_flux2.offset_image_ids(super().image_ids(lh, lw, device), offsets)
+
+    def activate_adapters(self, model: nn.Module, sel: BatchSelection, text_seq_len: int):
+        # Also thread in the text length the single blocks split on.
+        set_selection(model, sel)
+        for module in model.modules():
+            if isinstance(module, TeamworkFlux2SingleTransformerBlock):
+                module.text_seq_len = text_seq_len  # type: ignore  # nn.Module.__setattr__
+
+
+class TeamworkFlux2SingleTransformerBlock(Flux2SingleTransformerBlock, AdapterMixin[LegacyJointSelection, nn.Parameter]):
     """Teamwork-enabled Flux2 single (parallel) block.
 
     Flux2's single block fuses QKV+MLP-in into one projection (`attn.to_qkv_mlp_proj`)

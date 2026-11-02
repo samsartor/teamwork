@@ -25,15 +25,6 @@ class Components:
     batch_size: int  # B, the number of batch elements (>= max batch_indices + 1)
 
 
-@dataclass(frozen=True)
-class Selection(Components):
-    enabled: bool
-    batch_matrix: Tensor # (components, batch): bool
-    present_matrix: Tensor # (batch, num_teammates): bool, whether each (batch, teammate) slot has a component
-    first_component_per_batch: Tensor # (batch,): int, index of the first component belonging to each batch
-    attn_keep: Tensor | None = None # (num_teammates, num_teammates): bool, per-pair cross-teammate attention mask
-
-
 @dataclass
 class ComponentInBatch:
     teammate: int
@@ -483,51 +474,27 @@ class TeamBuilder:
             batch_size=self.batch_size,
         )
 
-    def selection(self) -> Selection:
-        components = self.components_index()
-        T = components.num_teammates
-        batch_matrix = torch.zeros(self.count, self.batch_size, dtype=torch.bool)
-        present_matrix = torch.zeros(self.batch_size, T, dtype=torch.bool)
-        first_component_per_batch = torch.full(
-            (self.batch_size,), -1, dtype=torch.int64
-        )
-
-        for i, component in enumerate(self.components):
-            batch_matrix[i, component.batch_idx] = True
-            present_matrix[component.batch_idx, component.teammate] = True
-            if first_component_per_batch[component.batch_idx] == -1:
-                first_component_per_batch[component.batch_idx] = i
-
-        # attn_keep gates cross-teammate attention; combine the static allow matrix
-        # (from cfg) with random dropout. Diagonal is always True so a teammate can
-        # always self-attend. Drop the tensor entirely when it would be all-True
-        # (the BlockMask fast-path).
+    def attn_keep(self) -> Tensor | None:
+        """
+        The (T, T) bool matrix of kept teammate-to-teammate attention edges, combining the
+        static `attn_allow` matrix with random attention dropout (from the global RNG), or
+        None when every edge is kept. The diagonal is always True so a teammate can always
+        self-attend. Only implementations where teammates attend to each other read this.
+        """
+        T = len(self.teammates)
         allow = self._attn_allow_tensor
         if self.dropout_prob > 0 and T > 1:
             drop = torch.bernoulli(torch.full((T, T), 1.0 - self.dropout_prob)).bool()
             keep = drop if allow is None else (allow & drop)
         else:
             keep = allow
-        attn_keep: Tensor | None = None
-        if keep is not None:
-            keep = keep.clone()
-            keep.fill_diagonal_(True)
-            if not bool(keep.all()):
-                attn_keep = keep.to(self.device)
-
-        return Selection(
-            teammate_indices=components.teammate_indices,
-            batch_indices=components.batch_indices,
-            input_subindices=components.input_subindices,
-            output_subindices=components.output_subindices,
-            num_teammates=components.num_teammates,
-            batch_size=components.batch_size,
-            enabled=True,
-            batch_matrix=batch_matrix.to(self.device),
-            present_matrix=present_matrix.to(self.device),
-            first_component_per_batch=first_component_per_batch.to(self.device),
-            attn_keep=attn_keep,
-        )
+        if keep is None:
+            return None
+        keep = keep.clone()
+        keep.fill_diagonal_(True)
+        if bool(keep.all()):
+            return None
+        return keep.to(self.device)
 
     def unpack_decoded_images(
         self,

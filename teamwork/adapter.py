@@ -10,25 +10,44 @@ see the pipeline_*.py files which include profiles for a number of common models
 
 from collections import OrderedDict
 import torch
-from torch import nn
+from torch import nn, Tensor
 from typing import Any, TypeAlias
 import re
 from copy import copy
 from collections import defaultdict
 
 from .config import TeamworkConfig
-from .data import Selection
 
 
-class AdapterMixin[Params]:
+class LoraParameters(nn.Module):
     """
-    Implemented by adapted layers. See TeamworkLinear in linear.py
+    Per-teammate LoRA weights, shared by the batch and sequence implementations:
+    `down (T, in, r)`, `up (T, r, out)`, and an optional `bias (T, out)`.
+    Saved under `<module path>.adapter.down|up|bias`.
+    """
+
+    def __init__(self, down: Tensor, up: Tensor, bias: Tensor | None):
+        super().__init__()
+
+        self.down = nn.Parameter(down)
+        nn.init.normal_(self.down, mean=0.0, std=0.02)
+        self.up = nn.Parameter(up)
+        nn.init.zeros_(self.up)
+        if bias is not None:
+            self.bias = nn.Parameter(bias)
+            nn.init.zeros_(self.bias)
+        else:
+            self.bias = None
+
+
+class AdapterMixin[Sel, Params]:
+    """
+    Implemented by adapted layers. See BatchTeamworkLinear in batch_linear.py
 
     Anything trainable must be in the child module/param called "adapter".
-    Even if there are no trainable parameters, it is still a good idea to include
-    something so the adapter is visible in checkpoint files.
 
-    The `selection` field will contain information about the currently active teammates.
+    The `selection` field will contain information about the currently active teammates,
+    of whatever selection type the implementation reads (e.g. `BatchSelection`).
 
     In general an implementation should look like this:
     ```
@@ -45,7 +64,7 @@ class AdapterMixin[Params]:
     """
 
     adapter: Params
-    selection: Selection | None = None
+    selection: Sel | None = None
 
 
 Adapt: TypeAlias = str | tuple[str, type[AdapterMixin]]
@@ -65,17 +84,17 @@ def adapt_single(
 
     if isinstance(adapt, str):
         if GGUFLinear is not None and isinstance(module, GGUFLinear):
-            from .linear import TeamworkGGUFLinear
+            from .batch_linear import BatchTeamworkGGUFLinear
 
-            return TeamworkGGUFLinear(module, cfg)
+            return BatchTeamworkGGUFLinear(module, cfg)
         elif isinstance(module, nn.Linear):
-            from .linear import TeamworkLinear
+            from .batch_linear import BatchTeamworkLinear
 
-            return TeamworkLinear(module, cfg)
+            return BatchTeamworkLinear(module, cfg)
         elif isinstance(module, nn.Conv2d):
-            from .linear import TeamworkConv2d
+            from .batch_linear import BatchTeamworkConv2d
 
-            return TeamworkConv2d(module, cfg)
+            return BatchTeamworkConv2d(module, cfg)
         else:
             raise NotImplementedError(
                 f"automatic adapter for {type(module)} (via {adapt})"
@@ -259,8 +278,12 @@ def adapter_modules(module: nn.Module) -> OrderedDict[str, AdapterMixin]:
     )
 
 def disable_adapters(module: nn.Module):
+    set_selection(module, None)
+
+def set_selection(module: nn.Module, selection: Any):
+    """Activate every adapter in `module` for the given selection (None runs the base model)."""
     for adapter in adapter_modules(module).values():
-        adapter.selection = None
+        adapter.selection = selection
 
 def adapter_parameters(module: nn.Module) -> OrderedDict[str, nn.Parameter]:
     return OrderedDict(

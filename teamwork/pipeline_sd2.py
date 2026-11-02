@@ -9,13 +9,13 @@ from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 
 from .pipelines import TeamworkPipeline, LossOutput
 from .config import TeamworkConfig
-from .adapter import adapt, TEAMWORK_PROFILES, Adapt, adapter_modules
+from .adapter import adapt, TEAMWORK_PROFILES, Adapt, set_selection
 from .checkpoint import save_adapters
 from .data import TeamBuilder, OutputImageType
-from .attn import TeamworkJointAttention
+from .batch_linear import BatchSelection
 
 
-class StableDiffusion2TeamworkPipeline(TeamworkPipeline, StableDiffusionPipeline):
+class BatchSD2Pipeline(TeamworkPipeline, StableDiffusionPipeline):
     teamwork_config: TeamworkConfig
     empty_prompt_embeds: None | Tensor = None
 
@@ -30,6 +30,7 @@ class StableDiffusion2TeamworkPipeline(TeamworkPipeline, StableDiffusionPipeline
         training: bool = False,
         grad_checkpointing: bool = True,
     ):
+        cls.check_layout(teamwork_config)
         pipeline = cls(**base_pipeline.components)  # type: ignore
         pipeline.teamwork_config = teamwork_config
         pipeline.unet = adapt(
@@ -97,7 +98,7 @@ class StableDiffusion2TeamworkPipeline(TeamworkPipeline, StableDiffusionPipeline
         prompt: str = "",
     ) -> LossOutput:
         with torch.no_grad():
-            sel = batch.selection()
+            sel = BatchSelection.from_components(batch.components_index())
 
             # Sample a random timestep for each image
             train_scheduler = DDPMScheduler.from_config(self.scheduler.config)
@@ -152,9 +153,7 @@ class StableDiffusion2TeamworkPipeline(TeamworkPipeline, StableDiffusionPipeline
         if extra is not None:
             model_input = torch.cat([noisy_latents, extra], dim=1)
 
-        # Update selection
-        for adapter in adapter_modules(self.unwrapped_unet).values():
-            adapter.selection = sel
+        set_selection(self.unwrapped_unet, sel)
 
         # Predict the noise residual
         model_pred = self.unet(
@@ -206,7 +205,7 @@ class StableDiffusion2TeamworkPipeline(TeamworkPipeline, StableDiffusionPipeline
         timesteps = self.scheduler.timesteps
 
         # Initialize latents
-        sel = batch.selection()
+        sel = BatchSelection.from_components(batch.components_index())
         clean_latents = batch.packed_encoded_images(
             self.vae_encode, self.unwrapped_unet.config["in_channels"], 1 / self.vae_scale_factor
         )
@@ -244,9 +243,7 @@ class StableDiffusion2TeamworkPipeline(TeamworkPipeline, StableDiffusionPipeline
         # Get extra channels if present
         extra = batch.packed_scaled_extra(1 / self.vae_scale_factor)
 
-        # Update selection
-        for adapter in adapter_modules(self.unwrapped_unet).values():
-            adapter.selection = sel
+        set_selection(self.unwrapped_unet, sel)
 
         # Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -307,9 +304,4 @@ TEAMWORK_PROFILES["SD2"] = [
     "*.*.resnets.*.conv1",
     "*.*.resnets.*.conv2",
     "*.*.resnets.*.conv_shortcut",
-]
-
-TEAMWORK_PROFILES["SD2_PLUSATTN"] = [
-    *TEAMWORK_PROFILES["SD2"],
-    ("*.*.attentions.*.transformer_blocks.*.attn1", TeamworkJointAttention),
 ]
