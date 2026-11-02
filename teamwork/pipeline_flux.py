@@ -117,9 +117,10 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
         noise: torch.Tensor,
         prompt: str | list[str] = "",
     ) -> LossOutput:
-        assert isinstance(self.scheduler, FlowMatchEulerDiscreteScheduler)
-        assert self.scheduler.timesteps is not None
-        assert self.scheduler.sigmas is not None
+        # A fresh scheduler, so training timesteps don't depend on the inference schedule
+        # that __call__ last set on self.scheduler.
+        train_scheduler = FlowMatchEulerDiscreteScheduler.from_config(self.scheduler.config)
+        assert isinstance(train_scheduler, FlowMatchEulerDiscreteScheduler)
 
         with torch.no_grad():
             if self.timestep_weight == "unit" or self.timestep_weight == "sigma_sqrt":
@@ -131,9 +132,9 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
 
             sel = batch.selection()
             timestep_u = timestep_u[sel.batch_indices.cpu()]
-            timestep_i = (timestep_u * len(self.scheduler.timesteps)).long()
+            timestep_i = (timestep_u * len(train_scheduler.timesteps)).long()
             timesteps = (
-                self.scheduler.timesteps[timestep_i]
+                train_scheduler.timesteps[timestep_i]
                 .to(device=self.device, dtype=self.dtype)
             )
 
@@ -150,7 +151,7 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
             latents = batch.packed_encoded_images(
                 self.vae_encode, self.in_channels, 1 / self.vae_scale_factor
             )
-            sigmas = self.scheduler.sigmas[timestep_i].reshape(batch.count, 1, 1, 1).to(
+            sigmas = train_scheduler.sigmas[timestep_i].reshape(batch.count, 1, 1, 1).to(
                 dtype=self.dtype, device=self.device
             )
             noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
@@ -342,7 +343,7 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
 
         # Set timesteps
         sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
-        image_seq_len = latents.shape[1]
+        image_seq_len = (lh // 2) * (lw // 2)  # packed tokens, not latent channels
         mu = calculate_shift(
             image_seq_len,
             self.scheduler.config.get("base_image_seq_len", 256),

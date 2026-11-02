@@ -16,7 +16,7 @@ from diffusers.models.transformers.transformer_flux2 import (
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
-from einops import rearrange
+from einops import rearrange, repeat
 import numpy as np
 
 from .pipelines import TeamworkPipeline, LossOutput
@@ -82,19 +82,38 @@ class Flux2TeamworkPipeline(TeamworkPipeline, Flux2KleinPipeline):
     def load_extra_metadata(self, metadata: dict[str, str]):
         pass
 
+    @property
+    def legacy_latents(self) -> bool:
+        """Version 1.0 checkpoints were trained on raw, sampled VAE latents."""
+        return self.teamwork_config.version == "1.0"
+
+    def _latent_bn_stats(self, lh: int, lw: int, x: Tensor) -> tuple[Tensor, Tensor]:
+        """The VAE's BN mean/std, laid out on the unpatchified (b, 32, lh, lw) grid.
+
+        Klein normalizes the 2x2-patchified latents with `vae.bn`, whose 128 channels are
+        ordered (c ph pw), matching Flux2KleinPipeline._patchify_latents and our packing.
+        """
+        bn = self.vae.bn
+        assert bn.running_mean is not None and bn.running_var is not None
+        std = torch.sqrt(bn.running_var + self.vae.config["batch_norm_eps"])
+        layout = "(c ph pw) -> 1 c (h ph) (w pw)"
+        mean = repeat(bn.running_mean, layout, ph=2, pw=2, h=lh // 2, w=lw // 2)
+        std = repeat(std, layout, ph=2, pw=2, h=lh // 2, w=lw // 2)
+        return mean.to(x.device, x.dtype), std.to(x.device, x.dtype)
+
     def vae_encode(self, x: Tensor) -> Tensor:
         x = x.to(self.vae.device, self.vae.dtype)
-        x = self.vae.encode(x).latent_dist.sample()  # type: ignore
-        x = (x - (self.vae.config.get("shift_factor", None) or 0)) * (
-            self.vae.config.get("scaling_factor", None) or 1
-        )
-        return x
+        if self.legacy_latents:
+            return self.vae.encode(x).latent_dist.sample()  # type: ignore
+        x = self.vae.encode(x).latent_dist.mode()  # type: ignore
+        mean, std = self._latent_bn_stats(x.shape[2], x.shape[3], x)
+        return (x - mean) / std
 
     def vae_decode(self, x: Tensor) -> Tensor:
-        x = x / (self.vae.config.get("scaling_factor", None) or 1) + (
-            self.vae.config.get("shift_factor", None) or 0
-        )
         x = x.to(self.vae.device, self.vae.dtype)
+        if not self.legacy_latents:
+            mean, std = self._latent_bn_stats(x.shape[2], x.shape[3], x)
+            x = x * std + mean
         x = self.vae.decode(x, return_dict=False)[0]  # type: ignore
         return x
 
@@ -148,9 +167,10 @@ class Flux2TeamworkPipeline(TeamworkPipeline, Flux2KleinPipeline):
         noise: torch.Tensor,
         prompt: str | list[str] = "",
     ) -> LossOutput:
-        assert isinstance(self.scheduler, FlowMatchEulerDiscreteScheduler)
-        assert self.scheduler.timesteps is not None
-        assert self.scheduler.sigmas is not None
+        # A fresh scheduler, so training timesteps don't depend on the inference schedule
+        # that __call__ last set on self.scheduler.
+        train_scheduler = FlowMatchEulerDiscreteScheduler.from_config(self.scheduler.config)
+        assert isinstance(train_scheduler, FlowMatchEulerDiscreteScheduler)
 
         with torch.no_grad():
             if self.timestep_weight == "unit" or self.timestep_weight == "sigma_sqrt":
@@ -162,9 +182,9 @@ class Flux2TeamworkPipeline(TeamworkPipeline, Flux2KleinPipeline):
 
             sel = batch.selection()
             timestep_u = timestep_u[sel.batch_indices.cpu()]
-            timestep_i = (timestep_u * len(self.scheduler.timesteps)).long()
+            timestep_i = (timestep_u * len(train_scheduler.timesteps)).long()
             timesteps = (
-                self.scheduler.timesteps[timestep_i]
+                train_scheduler.timesteps[timestep_i]
                 .to(device=self.device, dtype=self.dtype)
             )
 
@@ -175,7 +195,7 @@ class Flux2TeamworkPipeline(TeamworkPipeline, Flux2KleinPipeline):
             latents = batch.packed_encoded_images(
                 self.vae_encode, self.in_channels, 1 / self.vae_scale_factor
             )
-            sigmas = self.scheduler.sigmas[timestep_i].reshape(batch.count, 1, 1, 1).to(
+            sigmas = train_scheduler.sigmas[timestep_i].reshape(batch.count, 1, 1, 1).to(
                 dtype=self.dtype, device=self.device
             )
             noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
@@ -326,7 +346,7 @@ class Flux2TeamworkPipeline(TeamworkPipeline, Flux2KleinPipeline):
 
         # Set timesteps
         sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
-        image_seq_len = latents.shape[1]
+        image_seq_len = (lh // 2) * (lw // 2)  # packed tokens, not latent channels
         mu = compute_empirical_mu(image_seq_len=image_seq_len, num_steps=num_inference_steps)
         timesteps, num_inference_steps = retrieve_timesteps(
             self.scheduler,

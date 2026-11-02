@@ -137,9 +137,10 @@ class StableDiffusion3RGB2XPipeline(TeamworkPipeline, StableDiffusion3Pipeline):
         model: Any | None = None,
         prompt: str = "",
     ) -> LossOutput:
-        assert isinstance(self.scheduler, FlowMatchEulerDiscreteScheduler)
-        assert self.scheduler.timesteps is not None
-        assert self.scheduler.sigmas is not None
+        # A fresh scheduler, so training timesteps don't depend on the inference schedule
+        # that __call__ last set on self.scheduler.
+        train_scheduler = FlowMatchEulerDiscreteScheduler.from_config(self.scheduler.config)
+        assert isinstance(train_scheduler, FlowMatchEulerDiscreteScheduler)
 
         with torch.no_grad():
             ibatch, obatch = batch.split_io()
@@ -161,9 +162,9 @@ class StableDiffusion3RGB2XPipeline(TeamworkPipeline, StableDiffusion3Pipeline):
             noise = noise[batch.selection().output_subindices]
 
             # Figure out how much noise to add to the latents
-            timestep_i = (timestep_u * len(self.scheduler.timesteps)).long()
+            timestep_i = (timestep_u * len(train_scheduler.timesteps)).long()
             timesteps = (
-                self.scheduler.timesteps[timestep_i]
+                train_scheduler.timesteps[timestep_i]
                 .to(device=self.device, dtype=self.dtype)
                 .repeat(obatch.count)
             )
@@ -174,7 +175,7 @@ class StableDiffusion3RGB2XPipeline(TeamworkPipeline, StableDiffusion3Pipeline):
                 self.transformer.config["in_channels"],
                 1 / self.vae_scale_factor,
             )
-            sigmas = self.scheduler.sigmas[timestep_i].to(
+            sigmas = train_scheduler.sigmas[timestep_i].to(
                 dtype=self.dtype, device=self.device
             )
             noisy_latents = (1.0 - sigmas) * latents + sigmas * noise

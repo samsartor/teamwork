@@ -54,6 +54,11 @@ def default_teammate_image_ids(profile: str | None, num_teammates: int) -> list[
     return list(range(num_teammates))
 
 
+# 1.1: FLUX.2 Klein trains/samples on BN-normalized posterior-mean latents.
+CURRENT_VERSION = "1.1"
+KNOWN_VERSIONS = ("1.0", "1.1")
+
+
 @dataclass(frozen=True)
 class TeamworkConfig:
     """
@@ -73,6 +78,10 @@ class TeamworkConfig:
             Defaults (resolved at construction and stored in the checkpoint) come from
             ``default_teammate_image_ids``; set explicitly to control which teammates act
             as generated (T=0) vs reference (T>0) images for models like klein.
+        version: checkpoint format version. New configs get ``CURRENT_VERSION``; checkpoints
+            saved before the field existed load as ``"1.0"``. Pipelines branch on it where a
+            fix changed what trained weights expect (e.g. 1.0 FLUX.2 Klein checkpoints were
+            trained on raw, sampled VAE latents instead of BN-normalized posterior means).
 
     General Attributes:
         base_model: The checkpoint or model name from which the adapter was or will be trained
@@ -92,6 +101,7 @@ class TeamworkConfig:
     use_bias: bool = True
     attn_allow: str | None = None
     teammate_image_ids: list[int] | None = None
+    version: str = CURRENT_VERSION
 
     def __post_init__(self):
         for teammate in self.teammates:
@@ -112,6 +122,8 @@ class TeamworkConfig:
                 f"teammate_image_ids must have one entry per teammate "
                 f"({len(self.teammates)}), got {len(self.teammate_image_ids)}"
             )
+        if self.version not in KNOWN_VERSIONS:
+            raise ValueError(f"unknown teamwork version {self.version!r}, expected one of {KNOWN_VERSIONS}")
 
 
 def config_to_metadata(cfg: TeamworkConfig) -> dict[str, str]:
@@ -123,7 +135,6 @@ def config_to_metadata(cfg: TeamworkConfig) -> dict[str, str]:
         "modelspec.title": cfg.title,
         "modelspec.type": "teamwork",
         "base_model": cfg.base_model,
-        "teamwork.version": "1.0",
     }
     if cfg.resolution is not None:
         metadata["modelspec.resolution"] = cfg.resolution
@@ -147,6 +158,8 @@ def metadata_to_config(metadata: dict[str, str]) -> TeamworkConfig:
     cfg_dict["base_model"] = metadata.get("base_model", "unknown")
     cfg_dict["title"] = metadata.get("modelspec.title", "Teamwork Model")
     cfg_dict["resolution"] = metadata.get("modelspec.resolution")
+    # Checkpoints from before the version field predate every format change.
+    cfg_dict["version"] = metadata.get("teamwork.version", "1.0")
     known = {f.name for f in fields(TeamworkConfig)}
     for k, v in metadata.items():
         if k.startswith("teamwork."):
