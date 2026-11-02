@@ -33,7 +33,7 @@ from teamwork.attn import LegacyJointSelection
 # Klein import so a half-finished Klein port doesn't block the Flux1 cases.
 import teamwork.pipeline_flux  # noqa: F401  registers FLUX (sequence parity: test_flux_sequence_parity.py)
 try:
-    import teamwork.pipeline_flux2_klein  # noqa: F401  registers FLUX2 / FLUX2_PLUSATTN
+    import teamwork.pipeline_flux2_klein  # noqa: F401  registers FLUX2
 except Exception as e:  # pragma: no cover - while the port is in progress
     print(f"(note: could not import pipeline_flux2_klein: {e!r})")
 
@@ -110,23 +110,6 @@ CASES = {
         teammates=["image.in", "albedo.out"],
         num_components=2,
         exact=True,
-    ),
-    "flux2-plusattn": dict(
-        repo="black-forest-labs/FLUX.2-klein-4B",
-        model_cls="Flux2Transformer2DModel",
-        profile="FLUX2_PLUSATTN",
-        n_axes=4,
-        in_channels=128,
-        joint_dim=7680,
-        pooled_dim=None,
-        guidance=None,
-        teammates=["image.out"],
-        num_components=1,  # single teammate => equals base self-attention
-        exact=False,
-        # 4B fits in fp32, so use it for a tight (kernel-only) gate. In bf16 the
-        # flex-vs-sdpa noise over deep head_dim=128 single blocks is ~3%, which is
-        # too coarse to catch a structural regression here.
-        dtype="fp32",
     ),
 }
 

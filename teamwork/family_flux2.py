@@ -83,7 +83,8 @@ def encode_prompt(pipe: Any, prompt: str | list[str], count: int, dtype: torch.d
     """
     `(prompt_embeds, text_ids)` for `count` rows, from the cached empty prompt (see
     `empty_prompts`) if there is one, otherwise from the Qwen3 text encoder.
-    Klein has no pooled embeddings.
+    Klein has no pooled embeddings. The ids stay float32: Klein's text positions run to 511,
+    which bf16 can't represent exactly.
     """
     if pipe.empty_prompt_embeds is not None:
         assert pipe.empty_text_ids is not None
@@ -94,7 +95,7 @@ def encode_prompt(pipe: Any, prompt: str | list[str], count: int, dtype: torch.d
             prompt,
             num_images_per_prompt=count if isinstance(prompt, str) else 1,
         )
-    return prompt_embeds.to(dtype), text_ids.to(dtype)
+    return prompt_embeds.to(dtype), text_ids.to(torch.float32)
 
 
 def inference_timesteps(

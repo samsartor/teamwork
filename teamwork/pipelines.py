@@ -204,9 +204,9 @@ def automatic_pipeline(base: Any, config: TeamworkConfig) -> type[TeamworkPipeli
 
         return SequenceFluxPipeline if sequence else BatchFluxPipeline
     if base_type.__name__ == "Flux2KleinPipeline":
-        from .pipeline_flux2_klein import BatchFlux2KleinPipeline, LegacyJointFlux2KleinPipeline
+        from .pipeline_flux2_klein import BatchFlux2KleinPipeline, SequenceFlux2KleinPipeline
 
-        return LegacyJointFlux2KleinPipeline if sequence else BatchFlux2KleinPipeline
+        return SequenceFlux2KleinPipeline if sequence else BatchFlux2KleinPipeline
     raise NotImplementedError(
         f"automatic teamwork pipeline for {base_type} ({config.base_model})"
     )
