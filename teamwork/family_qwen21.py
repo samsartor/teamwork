@@ -264,6 +264,34 @@ def image_to_pil(x: Tensor) -> PIL.Image.Image:
     return PIL.Image.fromarray(rearrange(u8, "c h w -> h w c").cpu().numpy())
 
 
+class PatchConv3d(nn.Conv3d):
+    """
+    A Conv3d whose kernel equals its stride and its input (Qwen3-VL's vision patch embedding),
+    computed as one matmul. In torch 2.9.1 / cuDNN 9.10 the bf16 Conv3d path takes ~24 s per
+    1024² image; the matmul takes milliseconds. Installed by swapping `__class__`, so the
+    parameters and state-dict keys stay the base model's.
+    """
+
+    def forward(self, input: Tensor) -> Tensor:
+        assert tuple(self.stride) == tuple(self.kernel_size), (self.stride, self.kernel_size)
+        assert tuple(input.shape[2:]) == tuple(self.kernel_size), (input.shape, self.kernel_size)
+        assert self.groups == 1 and all(p == 0 for p in self.padding), (self.groups, self.padding)  # type: ignore[union-attr]
+        out = einsum(input, self.weight, "n c t h w, o c t h w -> n o")
+        if self.bias is not None:
+            out = out + self.bias
+        return rearrange(out, "n o -> n o 1 1 1")
+
+
+def use_matmul_patch_embed(text_encoder: nn.Module):
+    """Idempotently switch Qwen3-VL's vision patch-embedding conv(s) to `PatchConv3d`."""
+    swapped = 0
+    for name, module in text_encoder.named_modules():
+        if name.endswith("patch_embed.proj") and type(module) in (nn.Conv3d, PatchConv3d):
+            module.__class__ = PatchConv3d
+            swapped += 1
+    assert swapped > 0, "no Qwen3-VL patch_embed.proj Conv3d found in the text encoder"
+
+
 @torch.no_grad()
 def encode_prompts(
     pipe: Any,
@@ -280,6 +308,7 @@ def encode_prompts(
     num_images = {len(i) for i in images}
     assert len(num_images) == 1, f"every batch element needs the same number of condition images: {num_images}"
     device = pipe.text_encoder.device
+    use_matmul_patch_embed(pipe.text_encoder)
     rows: list[tuple[Tensor, Tensor, Tensor]] = []
     for prompt, condition in zip(prompts, images):
         embeds, mask, pad = pipe._get_qwen_prompt_embeds(
