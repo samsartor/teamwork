@@ -38,18 +38,18 @@ def parse_attn_allow(s: str, num_teammates: int) -> list[list[bool]]:
     return matrix
 
 
-def default_teammate_image_ids(profile: str | None, num_teammates: int) -> list[int]:
-    """Default per-teammate RoPE image-id T-offset for the joint-attention layout.
+def default_teammate_image_ids(profile: str | None, layout: str, num_teammates: int) -> list[int]:
+    """Default per-teammate RoPE image-id T-offset for the sequence layout.
 
-    Without a joint-attention (``*PLUSATTN``) profile these offsets are unused, so
-    keep every teammate aligned at 0. ``FLUX2_PLUSATTN`` mirrors klein's
-    reference-image convention (T = 0, 10, 20, ... via Flux2 ``_prepare_image_ids``
-    scale) so zero-LoRA joint attention reduces to base editing; other joint
-    profiles use distinct adjacent coords (0, 1, 2, ...).
+    In the batch layout these offsets are unused, so keep every teammate aligned at 0.
+    FLUX.2 Klein mirrors its reference-image convention (T = 0, 10, 20, ... via Flux2
+    ``_prepare_image_ids`` scale) so zero-LoRA sequence teamwork reduces to base editing;
+    other FLUX-style families use distinct adjacent coords (0, 1, 2, ...). Families with
+    their own position rule (Qwen-Image 2.1) ignore these ids.
     """
-    if profile is None or "PLUSATTN" not in profile:
+    if layout != "sequence":
         return [0] * num_teammates
-    if profile == "FLUX2_PLUSATTN":
+    if profile in ("FLUX2", "FLUX2_PLUSATTN"):
         return list(range(0, 10 * num_teammates, 10))
     return list(range(num_teammates))
 
@@ -65,7 +65,7 @@ Layout = Literal["batch", "sequence"]
 
 
 def is_joint_attention_profile(profile: str | None) -> bool:
-    """The `*_PLUSATTN` profiles, whose structural adapters implement the sequence layout."""
+    """The legacy `*_PLUSATTN` profile names (before 2.0, the only sequence-layout checkpoints)."""
     return profile is not None and profile.endswith("_PLUSATTN")
 
 
@@ -131,23 +131,18 @@ class TeamworkConfig:
             parse_attn_allow(self.attn_allow, len(self.teammates))
         # Resolve the default eagerly so the concrete list is stored in the
         # checkpoint (frozen dataclass, so set via object.__setattr__).
+        if self.layout not in get_args(Layout):
+            raise ValueError(f"unknown layout {self.layout!r}, expected one of {get_args(Layout)}")
         if self.teammate_image_ids is None:
             object.__setattr__(
                 self,
                 "teammate_image_ids",
-                default_teammate_image_ids(self.profile, len(self.teammates)),
+                default_teammate_image_ids(self.profile, self.layout, len(self.teammates)),
             )
         elif len(self.teammate_image_ids) != len(self.teammates):
             raise ValueError(
                 f"teammate_image_ids must have one entry per teammate "
                 f"({len(self.teammates)}), got {len(self.teammate_image_ids)}"
-            )
-        if self.layout not in get_args(Layout):
-            raise ValueError(f"unknown layout {self.layout!r}, expected one of {get_args(Layout)}")
-        if is_joint_attention_profile(self.profile) != (self.layout == "sequence"):
-            raise ValueError(
-                f"profile {self.profile!r} does not implement the {self.layout!r} layout: "
-                f"the sequence layout is implemented by the *_PLUSATTN profiles, and only by them"
             )
         if self.text_teammate is not None:
             if self.text_teammate not in self.teammates:
@@ -229,6 +224,8 @@ def metadata_to_config(metadata: dict[str, str]) -> TeamworkConfig:
             raise ValueError(f"teamwork {cfg_dict['version']} metadata is missing teamwork.layout")
         assert "text_teammate" not in cfg_dict, "text_teammate without layout"
         if is_joint_attention_profile(cfg_dict.get("profile")):
+            # The sequence layout is now a config field, not a profile: FLUX2_PLUSATTN -> FLUX2.
+            cfg_dict["profile"] = cfg_dict["profile"].removesuffix("_PLUSATTN")
             cfg_dict["layout"] = "sequence"
             cfg_dict["text_teammate"] = next(t for t in cfg_dict["teammates"] if t.endswith(".out"))
         else:
