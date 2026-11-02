@@ -21,7 +21,7 @@ import torch
 from einops import rearrange
 from PIL import Image
 
-from teamwork.batch import BatchBuilder
+from teamwork.data import TeamBuilder
 from teamwork.config import TeamworkConfig
 
 DEMO = Path(__file__).parent.parent / "demo" / "pink_input.png"
@@ -38,7 +38,7 @@ def psnr(a: Image.Image, b: Image.Image) -> float:
 def teamwork_edit(pipe, cfg: TeamworkConfig, src: Image.Image, edit_noise: torch.Tensor, **kwargs) -> Image.Image:
     """Run the teamwork pipeline with `edit_noise` as the edited teammate's initial noise."""
     device = torch.device("cuda")
-    batch = BatchBuilder.from_inputs(
+    batch = TeamBuilder.from_inputs(
         cfg.teammates, device, torch.bfloat16, images={"source": src}, attn_allow=cfg.attn_allow
     )
     noise = torch.zeros(batch.count, *edit_noise.shape, device=device, dtype=torch.bfloat16)

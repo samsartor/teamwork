@@ -10,16 +10,14 @@ see the pipeline_*.py files which include profiles for a number of common models
 
 from collections import OrderedDict
 import torch
-import safetensors.torch
 from torch import nn
-from typing import Optional, Tuple, Any, TypeAlias
-from pathlib import Path
+from typing import Any, TypeAlias
 import re
 from copy import copy
 from collections import defaultdict
 
-from .config import TeamworkConfig, config_to_metadata, metadata_to_config
-from .batch import Selection
+from .config import TeamworkConfig
+from .data import Selection
 
 
 class AdapterMixin[Params]:
@@ -202,9 +200,8 @@ def adapt(
                 adapted[parent_name] = parent
         return adapted[parent_name], attr
 
-    def replace_module(name: str, module: nn.Module | nn.Parameter):
-        if isinstance(module, nn.Module):
-            adapted[name] = module
+    def replace_module(name: str, module: nn.Module):
+        adapted[name] = module
 
         created = create_parent_copy(name)
         if created is not None:
@@ -217,14 +214,11 @@ def adapt(
     # If a state dictionary is given, then it should be used to establish
     # which layers are modified (instead of using the profile). We take
     # advantage of every adapted layer having a child called "adapter".
+    from .checkpoint import adapted_layers_in_state, load_adapter_state
+
     known = None
     if state is not None and infer_layers_from_state:
-        known = set()
-        adapter_pattern = re.compile(r"(.+).adapter(\..+)?")
-        for path in state.keys():
-            m = adapter_pattern.fullmatch(path)
-            if m is not None:
-                known.add(m.group(1))
+        known = adapted_layers_in_state(state)
 
     # Now we iterate over all the layers we should adapt, and update them.
     if override_profile is not None:
@@ -243,10 +237,11 @@ def adapt(
         replace_module(name, new)
         profile_counts[adapt] += 1
 
-    # And insert parameters from the state if any.
+    root = adapted.get("", model)
+
+    # And insert parameters from the state if any, strictly.
     if state is not None:
-        for path, tensor in state.items():
-            replace_module(path, nn.Parameter(tensor.to(device=device, dtype=dtype)))
+        load_adapter_state(root, state, device=device, dtype=dtype)
 
     # Finally check that everything in the profile did get applied. It is almost
     # always a bug/typo if one of the Adapt entries got skipped.
@@ -255,7 +250,7 @@ def adapt(
             print(f"WARNING: teamwork adapter {adapt} was not applied to any layers")
 
     # Return the root adapted object.
-    return adapted.get("", model)
+    return root
 
 
 def adapter_modules(module: nn.Module) -> OrderedDict[str, AdapterMixin]:
@@ -275,72 +270,3 @@ def adapter_parameters(module: nn.Module) -> OrderedDict[str, nn.Parameter]:
         for (pk, p) in m.named_parameters()
         if pk.startswith("adapter.") or pk == 'adapter'
     )
-
-
-def save_adapters(
-    module: nn.Module,
-    path: str | Path,
-    cfg: TeamworkConfig,
-    extra_metadata: Optional[dict[str, str]] = None,
-):
-    """
-    Save teamwork adapter parameters to a safetensors file.
-
-    Args:
-        module: The module containing teamwork adapters
-        path: Path to save the safetensors file
-        cfg: The TeamworkConfig used to create the adapters
-        extra_metadata: Optional additional metadata to store
-    """
-
-    state_dict = {}
-    for name, parameter in adapter_parameters(module).items():
-        state_dict[name] = parameter.detach()
-
-    metadata = config_to_metadata(cfg)
-    if extra_metadata:
-        metadata.update(extra_metadata)
-
-    return safetensors.torch.save_file(state_dict, str(path), metadata)
-
-
-def save_entire(
-    module: nn.Module,
-    path: str | Path,
-    cfg: TeamworkConfig,
-    extra_metadata: Optional[dict[str, str]] = None,
-):
-    """
-    Save the entire model to a safetensors file, but with teamwork metadata.
-
-    Args:
-        module: The module containing teamwork adapters
-        path: Path to save the safetensors file
-        cfg: The TeamworkConfig used to create the adapters
-        extra_metadata: Optional additional metadata to store
-    """
-
-    state_dict = {}
-    for name, parameter in module.named_parameters():
-        state_dict[name] = parameter.detach()
-
-    metadata = config_to_metadata(cfg)
-    if extra_metadata:
-        metadata.update(extra_metadata)
-
-    return safetensors.torch.save_file(state_dict, path, metadata)
-
-
-def load_safetensors(
-    path: str | Path,
-) -> Tuple[TeamworkConfig, dict[str, torch.Tensor], dict[str, str]]:
-    with safetensors.safe_open(path, framework="pt", device="cpu") as f:
-        metadata = f.metadata()
-        cfg = metadata_to_config(metadata)
-
-        # Load parameters
-        checkpoint = {}
-        for key in f.keys():
-            checkpoint[key] = f.get_tensor(key)
-
-        return cfg, checkpoint, metadata

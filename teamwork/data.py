@@ -11,14 +11,24 @@ from .config import parse_attn_allow
 
 
 @dataclass(frozen=True)
-class Selection:
-    enabled: bool
-    teammate_indices: Tensor # (components,): int
-    input_subindices: Tensor  # (input_components,): int
-    output_subindices: Tensor  # (output_components,): int
-    batch_indices: Tensor # (components): int
-    batch_matrix: Tensor # (components, batch): bool
+class Components:
+    """
+    Index of the components (rows of the packed `(count, C, h, w)` latents) in a TeamBuilder:
+    which teammate and batch element each one belongs to. Shared by every model layout.
+    """
+
+    teammate_indices: Tensor  # (components,): int, roster slot of each component
+    batch_indices: Tensor  # (components,): int, batch element of each component
+    input_subindices: Tensor  # (input_components,): int, components that are inputs
+    output_subindices: Tensor  # (output_components,): int, components that are outputs
     num_teammates: int  # T, the size of the teammate roster (>= max teammate_indices + 1)
+    batch_size: int  # B, the number of batch elements (>= max batch_indices + 1)
+
+
+@dataclass(frozen=True)
+class Selection(Components):
+    enabled: bool
+    batch_matrix: Tensor # (components, batch): bool
     present_matrix: Tensor # (batch, num_teammates): bool, whether each (batch, teammate) slot has a component
     first_component_per_batch: Tensor # (batch,): int, index of the first component belonging to each batch
     attn_keep: Tensor | None = None # (num_teammates, num_teammates): bool, per-pair cross-teammate attention mask
@@ -56,7 +66,7 @@ def image_pt2pil(image_pt: Tensor):
 OutputImageType: TypeAlias = Literal["pil", "np", "pt", "latents"]
 
 
-class BatchBuilder:
+class TeamBuilder:
     """
     Teamwork requires arranging input images and empty outputs into a batch, with information
     about which batch components corrispond to which model teammates. That is really a pain
@@ -286,10 +296,10 @@ class BatchBuilder:
                         )
                     )
 
-    def split_io(self) -> tuple["BatchBuilder", "BatchBuilder"]:
-        inputs = BatchBuilder(self.teammates, self.device, self.dtype, dropout_prob=self.dropout_prob, attn_allow=self.attn_allow)
+    def split_io(self) -> tuple["TeamBuilder", "TeamBuilder"]:
+        inputs = TeamBuilder(self.teammates, self.device, self.dtype, dropout_prob=self.dropout_prob, attn_allow=self.attn_allow)
         inputs.resolution = self.resolution
-        outputs = BatchBuilder(self.teammates, self.device, self.dtype, dropout_prob=self.dropout_prob, attn_allow=self.attn_allow)
+        outputs = TeamBuilder(self.teammates, self.device, self.dtype, dropout_prob=self.dropout_prob, attn_allow=self.attn_allow)
         outputs.resolution = self.resolution
         for component in self.components:
             if component.output:
@@ -448,18 +458,11 @@ class BatchBuilder:
 
         return torch.stack(cropinfos)
 
-    def selection(self) -> Selection:
+    def components_index(self) -> Components:
         teammate_indices = []
         input_indices = []
         output_indices = []
         batch_indices = []
-        T = len(self.teammates)
-        batch_matrix = torch.zeros(self.count, self.batch_size, dtype=torch.bool)
-        present_matrix = torch.zeros(self.batch_size, T, dtype=torch.bool)
-        first_component_per_batch = torch.full(
-            (self.batch_size,), -1, dtype=torch.int64
-        )
-
         for i, component in enumerate(self.components):
             teammate_indices.append(component.teammate)
             if component.output:
@@ -467,6 +470,29 @@ class BatchBuilder:
             else:
                 input_indices.append(i)
             batch_indices.append(component.batch_idx)
+
+        def index(values: list[int]) -> Tensor:
+            return torch.tensor(values, dtype=torch.int64, device=self.device)
+
+        return Components(
+            teammate_indices=index(teammate_indices),
+            batch_indices=index(batch_indices),
+            input_subindices=index(input_indices),
+            output_subindices=index(output_indices),
+            num_teammates=len(self.teammates),
+            batch_size=self.batch_size,
+        )
+
+    def selection(self) -> Selection:
+        components = self.components_index()
+        T = components.num_teammates
+        batch_matrix = torch.zeros(self.count, self.batch_size, dtype=torch.bool)
+        present_matrix = torch.zeros(self.batch_size, T, dtype=torch.bool)
+        first_component_per_batch = torch.full(
+            (self.batch_size,), -1, dtype=torch.int64
+        )
+
+        for i, component in enumerate(self.components):
             batch_matrix[i, component.batch_idx] = True
             present_matrix[component.batch_idx, component.teammate] = True
             if first_component_per_batch[component.batch_idx] == -1:
@@ -490,21 +516,14 @@ class BatchBuilder:
                 attn_keep = keep.to(self.device)
 
         return Selection(
+            teammate_indices=components.teammate_indices,
+            batch_indices=components.batch_indices,
+            input_subindices=components.input_subindices,
+            output_subindices=components.output_subindices,
+            num_teammates=components.num_teammates,
+            batch_size=components.batch_size,
             enabled=True,
-            teammate_indices=torch.tensor(
-                teammate_indices, dtype=torch.int64, device=self.device
-            ),
-            input_subindices=torch.tensor(
-                input_indices, dtype=torch.int64, device=self.device
-            ),
-            output_subindices=torch.tensor(
-                output_indices, dtype=torch.int64, device=self.device
-            ),
-            batch_indices=torch.tensor(
-                batch_indices, dtype=torch.int64, device=self.device
-            ),
             batch_matrix=batch_matrix.to(self.device),
-            num_teammates=T,
             present_matrix=present_matrix.to(self.device),
             first_component_per_batch=first_component_per_batch.to(self.device),
             attn_keep=attn_keep,
@@ -544,7 +563,7 @@ class BatchBuilder:
         return self.unpack_decoded_images(packed, lambda x: x, output_type=output_type, outputs_only=outputs_only)
 
     def unpacked_images(self, output_type: OutputImageType = 'pil', outputs_only: bool = False) -> list[dict[str, Tensor]]:
-        return self.unpack_images(self, self.packed_images(), output_type=output_type, outputs_only=outputs_only)
+        return self.unpack_images(self.packed_images(), output_type=output_type, outputs_only=outputs_only)
 
     @property
     def count(self):

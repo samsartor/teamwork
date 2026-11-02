@@ -14,7 +14,7 @@ from diffusers.models.embeddings import apply_rotary_emb
 from einops import rearrange
 
 from .adapter import AdapterMixin, TeamworkConfig, shallowcopy_into
-from .batch import Selection
+from .data import Selection
 
 
 def _teammate_block_mask(

@@ -48,7 +48,7 @@ from diffusers.schedulers.scheduling_euler_discrete import EulerDiscreteSchedule
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 
 from teamwork.adapter import adapter_parameters
-from teamwork.batch import BatchBuilder
+from teamwork.data import TeamBuilder
 from teamwork.config import TeamworkConfig
 from teamwork.pipeline_flux import FluxTeamworkPipeline
 from teamwork.pipelines import TeamworkPipeline
@@ -339,9 +339,14 @@ CASES: list[Case] = [
 
 
 def make_config(case: Case) -> TeamworkConfig:
+    # The version is left at the default for all but the legacy case, so the goldens
+    # recorded at 1.1 also check that newer versions keep 1.1's behavior.
     kwargs: dict[str, Any] = {}
     if case.version is not None:
         kwargs["version"] = case.version
+    if case.joint:
+        kwargs["layout"] = "sequence"
+        kwargs["text_teammate"] = "edited.out"
     return TeamworkConfig(
         teammates=ROSTER,
         lora_rank=LORA_RANK,
@@ -426,7 +431,7 @@ def run_case(case: Case, device: torch.device) -> tuple[dict[str, Tensor], dict[
     # Like training, the output is provided first.
     phase = "loss"
     torch.manual_seed(1)
-    batch = BatchBuilder(
+    batch = TeamBuilder(
         ROSTER, device, torch.float32,
         dropout_prob=JOINT_DROPOUT if case.joint else 0.0,
         attn_allow=pipe.teamwork_config.attn_allow,
@@ -458,7 +463,7 @@ def run_case(case: Case, device: torch.device) -> tuple[dict[str, Tensor], dict[
         {"source": images[0]["source"], "mask": images[0]["mask"]},
         {"source": images[1]["source"]},
     ]
-    batch = BatchBuilder.from_inputs(
+    batch = TeamBuilder.from_inputs(
         ROSTER, device, torch.float32, images=call_images, attn_allow=pipe.teamwork_config.attn_allow,
     )
     g = torch.Generator().manual_seed(4)

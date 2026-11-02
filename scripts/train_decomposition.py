@@ -18,9 +18,10 @@ from prodigyopt import Prodigy
 from tqdm import tqdm
 
 from teamwork import TeamworkConfig, TeamworkPipeline, adapter
+from teamwork.checkpoint import load_safetensors
 from teamwork.pipelines import automatic_pipeline
 from teamwork.utils import pdb_check, pdb_exception
-from teamwork.batch import BatchBuilder
+from teamwork.data import TeamBuilder
 
 app = typer.Typer(pretty_exceptions_show_locals=False)
 
@@ -154,7 +155,7 @@ def main(
     resume_state = None
     if resume_checkpoint is not None:
         assert resume_step >= 0, "please provide --resume-step"
-        _, resume_state, _ = adapter.load_safetensors(resume_checkpoint)
+        _, resume_state, _ = load_safetensors(resume_checkpoint)
     pipe = automatic_pipeline(base_pipeline, config).from_base_pipeline(
         base_pipeline=base_pipeline,
         teamwork_config=config,
@@ -256,7 +257,7 @@ def main(
                 pipe.save_adapters(output_checkpoint)
 
             # Get a batch of training data
-            batch = BatchBuilder(pipe.teamwork_config.teammates, device, dtype)
+            batch = TeamBuilder(pipe.teamwork_config.teammates, device, dtype)
             for batch_idx in range(batch_size):
                 train_sample = next(train_loader)
                 weight = (

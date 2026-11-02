@@ -1,6 +1,6 @@
 from dataclasses import dataclass, asdict, fields
 import re
-from typing import Any
+from typing import Any, Literal, get_args
 
 TEAMMATE_FMT = re.compile(r"[a-z]+\.(in|out)")
 
@@ -55,8 +55,18 @@ def default_teammate_image_ids(profile: str | None, num_teammates: int) -> list[
 
 
 # 1.1: FLUX.2 Klein trains/samples on BN-normalized posterior-mean latents.
-CURRENT_VERSION = "1.1"
-KNOWN_VERSIONS = ("1.0", "1.1")
+# 2.0: adds `layout`, `text_teammate`, and `vlm_inputs`. Klein latents are as in 1.1.
+CURRENT_VERSION = "2.0"
+KNOWN_VERSIONS = ("1.0", "1.1", "2.0")
+# Versions whose metadata predates `layout`, migrated by `metadata_to_config`.
+PRE_LAYOUT_VERSIONS = ("1.0", "1.1")
+
+Layout = Literal["batch", "sequence"]
+
+
+def is_joint_attention_profile(profile: str | None) -> bool:
+    """The `*_PLUSATTN` profiles, whose structural adapters implement the sequence layout."""
+    return profile is not None and profile.endswith("_PLUSATTN")
 
 
 @dataclass(frozen=True)
@@ -78,6 +88,13 @@ class TeamworkConfig:
             Defaults (resolved at construction and stored in the checkpoint) come from
             ``default_teammate_image_ids``; set explicitly to control which teammates act
             as generated (T=0) vs reference (T>0) images for models like klein.
+        layout: how teammates are arranged for the model. ``"batch"``: each teammate is a row
+            of the batch and teammates only communicate through LoRA. ``"sequence"``: the
+            teammates of a batch element share one token stream and attend to each other.
+            The joint-attention (``*_PLUSATTN``) profiles are the sequence implementation.
+        text_teammate: the roster name whose adapter applies to the text tokens in the sequence
+            layout, or None to leave text at the base model.
+        vlm_inputs: the ``.in`` teammates fed to the model's vision-language text encoder.
         version: checkpoint format version. New configs get ``CURRENT_VERSION``; checkpoints
             saved before the field existed load as ``"1.0"``. Pipelines branch on it where a
             fix changed what trained weights expect (e.g. 1.0 FLUX.2 Klein checkpoints were
@@ -101,6 +118,9 @@ class TeamworkConfig:
     use_bias: bool = True
     attn_allow: str | None = None
     teammate_image_ids: list[int] | None = None
+    layout: Layout = "batch"
+    text_teammate: str | None = None
+    vlm_inputs: tuple[str, ...] = ()
     version: str = CURRENT_VERSION
 
     def __post_init__(self):
@@ -122,6 +142,24 @@ class TeamworkConfig:
                 f"teammate_image_ids must have one entry per teammate "
                 f"({len(self.teammates)}), got {len(self.teammate_image_ids)}"
             )
+        if self.layout not in get_args(Layout):
+            raise ValueError(f"unknown layout {self.layout!r}, expected one of {get_args(Layout)}")
+        if is_joint_attention_profile(self.profile) != (self.layout == "sequence"):
+            raise ValueError(
+                f"profile {self.profile!r} does not implement the {self.layout!r} layout: "
+                f"the sequence layout is implemented by the *_PLUSATTN profiles, and only by them"
+            )
+        if self.text_teammate is not None:
+            if self.text_teammate not in self.teammates:
+                raise ValueError(f"text_teammate {self.text_teammate!r} is not in the roster {self.teammates}")
+            if self.layout != "sequence":
+                raise ValueError(f"text_teammate requires the sequence layout, not {self.layout!r}")
+        object.__setattr__(self, "vlm_inputs", tuple(self.vlm_inputs))
+        if len(set(self.vlm_inputs)) != len(self.vlm_inputs):
+            raise ValueError(f"vlm_inputs has duplicates: {self.vlm_inputs}")
+        for teammate in self.vlm_inputs:
+            if teammate not in self.teammates or not teammate.endswith(".in"):
+                raise ValueError(f"vlm_inputs entry {teammate!r} is not an input (.in) teammate of {self.teammates}")
         if self.version not in KNOWN_VERSIONS:
             raise ValueError(f"unknown teamwork version {self.version!r}, expected one of {KNOWN_VERSIONS}")
 
@@ -145,13 +183,21 @@ def config_to_metadata(cfg: TeamworkConfig) -> dict[str, str]:
             metadata["teamwork.teammates"] = ",".join(v)
         elif k == "teammate_image_ids":
             metadata["teamwork.teammate_image_ids"] = ",".join(str(x) for x in v)
+        elif k == "vlm_inputs":
+            metadata["teamwork.vlm_inputs"] = ",".join(v)
         elif v is not None:
             metadata[f"teamwork.{k}"] = str(v)
     return metadata
 
 
 def metadata_to_config(metadata: dict[str, str]) -> TeamworkConfig:
-    """Convert metadata dictionary back to TeamworkConfig"""
+    """
+    Convert metadata dictionary back to TeamworkConfig.
+
+    Metadata written before 2.0 has no `layout`: the joint-attention (``*_PLUSATTN``)
+    profiles migrate to the sequence layout with the first ``.out`` teammate adapting the
+    text (as they were trained), and everything else to the batch layout.
+    """
     cfg_dict: dict[str, Any] = {}
     if metadata.get("modelspec.type") != "teamwork":
         raise ValueError("checkpoint does not appear to be a teamwork model")
@@ -170,10 +216,21 @@ def metadata_to_config(metadata: dict[str, str]) -> TeamworkConfig:
                 cfg_dict[k] = v.split(",")
             elif k == "teammate_image_ids":
                 cfg_dict[k] = [int(x) for x in v.split(",")] if v else []
+            elif k == "vlm_inputs":
+                cfg_dict[k] = tuple(v.split(",")) if v else ()
             elif k == "lora_rank":
                 cfg_dict[k] = int(v)
             elif k in ["lora_communication", "use_bias"]:
                 cfg_dict[k] = v.lower() == "true"
             else:
                 cfg_dict[k] = v
+    if "layout" not in cfg_dict:
+        if cfg_dict["version"] not in PRE_LAYOUT_VERSIONS:
+            raise ValueError(f"teamwork {cfg_dict['version']} metadata is missing teamwork.layout")
+        assert "text_teammate" not in cfg_dict, "text_teammate without layout"
+        if is_joint_attention_profile(cfg_dict.get("profile")):
+            cfg_dict["layout"] = "sequence"
+            cfg_dict["text_teammate"] = next(t for t in cfg_dict["teammates"] if t.endswith(".out"))
+        else:
+            cfg_dict["layout"] = "batch"
     return TeamworkConfig(**cfg_dict)

@@ -11,8 +11,9 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
 
 from .pipelines import TeamworkPipeline, LossOutput
 from .config import TeamworkConfig
-from .adapter import adapt, save_adapters, TEAMWORK_PROFILES, Adapt, adapter_modules
-from .batch import BatchBuilder, OutputImageType
+from .adapter import adapt, TEAMWORK_PROFILES, Adapt, adapter_modules
+from .checkpoint import save_adapters
+from .data import TeamBuilder, OutputImageType
 from .attn import TeamworkJointAttention
 
 
@@ -99,7 +100,7 @@ class StableDiffusion3TeamworkPipeline(TeamworkPipeline, StableDiffusion3Pipelin
 
     def train_loss(
         self,
-        batch: BatchBuilder,
+        batch: TeamBuilder,
         noise: torch.Tensor,
         model: Any | None = None,
         prompt: str | list[str] = "",
@@ -207,11 +208,11 @@ class StableDiffusion3TeamworkPipeline(TeamworkPipeline, StableDiffusion3Pipelin
         height: int | None = None,
         width: int | None = None,
         output_type: OutputImageType = "pil",
-        batch: BatchBuilder | None = None,
+        batch: TeamBuilder | None = None,
     ) -> dict[str, Any] | list[dict[str, Any]]:
         device = self._execution_device
         if batch is None:
-            batch = BatchBuilder.from_inputs(
+            batch = TeamBuilder.from_inputs(
                  self.teamwork_config.teammates,
                  device=device,
                  dtype=self.dtype,

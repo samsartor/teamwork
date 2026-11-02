@@ -28,7 +28,7 @@ from diffusers.models.transformers.transformer_flux2 import Flux2Transformer2DMo
 
 from teamwork.config import TeamworkConfig
 from teamwork.adapter import adapt, adapter_modules
-from teamwork.batch import Selection
+from teamwork.data import Selection
 import teamwork.pipeline_flux2_klein  # noqa: F401  registers FLUX2 / FLUX2_PLUSATTN
 
 REPO = "black-forest-labs/FLUX.2-klein-4B"  # same architecture as 9B, faster to load
@@ -72,7 +72,7 @@ def teamwork_edit_prediction(adapted, gen, ref, text, hh, ww, offsets, device):
     """Zero-LoRA teamwork with teammates [edited.out(0), source.in(1)].
 
     Components: comp0 = source.in (input/ref, teammate 1), comp1 = edited.out
-    (output/gen, teammate 0), mirroring BatchBuilder (provide-before-request).
+    (output/gen, teammate 0), mirroring TeamBuilder (provide-before-request).
     `offsets[k]` is teammate k's RoPE T-coord. Returns the edited.out prediction.
     """
     L_img = hh * ww
@@ -91,6 +91,7 @@ def teamwork_edit_prediction(adapted, gen, ref, text, hh, ww, offsets, device):
         batch_indices=torch.zeros(2, dtype=torch.int64, device=device),
         batch_matrix=torch.ones(2, 1, dtype=torch.bool, device=device),
         num_teammates=T,
+        batch_size=1,
         present_matrix=torch.ones(1, T, dtype=torch.bool, device=device),
         first_component_per_batch=torch.zeros(1, dtype=torch.int64, device=device),
         attn_keep=None,

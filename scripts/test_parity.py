@@ -27,7 +27,7 @@ import torch
 
 from teamwork.config import TeamworkConfig
 from teamwork.adapter import adapt, adapter_modules, TEAMWORK_PROFILES
-from teamwork.batch import Selection
+from teamwork.data import Selection
 
 # Importing the pipeline modules registers their TEAMWORK_PROFILES. Guard the
 # Klein import so a half-finished Klein port doesn't block the Flux1 cases.
@@ -53,6 +53,7 @@ def single_batch_selection(teammate_indices, num_teammates, device):
         batch_indices=torch.zeros(n, dtype=torch.int64, device=device),
         batch_matrix=batch_matrix,
         num_teammates=num_teammates,
+        batch_size=1,
         present_matrix=present_matrix,
         first_component_per_batch=torch.zeros(1, dtype=torch.int64, device=device),
         attn_keep=None,

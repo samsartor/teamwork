@@ -7,8 +7,9 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 from .config import TeamworkConfig
-from .adapter import Adapt, load_safetensors
-from .batch import BatchBuilder, Selection
+from .adapter import Adapt
+from .checkpoint import load_safetensors
+from .data import TeamBuilder, Selection
 
 @dataclass
 class LossOutput:
@@ -119,7 +120,7 @@ class TeamworkPipeline(ABC):
     @abstractmethod
     def train_loss(
         self,
-        batch: BatchBuilder,
+        batch: TeamBuilder,
         noise: Tensor,
         model: Any | None = None,
     ) -> LossOutput:
