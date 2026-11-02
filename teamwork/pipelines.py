@@ -200,9 +200,9 @@ def automatic_pipeline(base: Any, config: TeamworkConfig) -> type[TeamworkPipeli
 
         return BatchSDXLPipeline
     if base_type.__name__ in ("FluxPipeline", "FluxKontextPipeline"):
-        from .pipeline_flux import BatchFluxPipeline, LegacyJointFluxPipeline
+        from .pipeline_flux import BatchFluxPipeline, SequenceFluxPipeline
 
-        return LegacyJointFluxPipeline if sequence else BatchFluxPipeline
+        return SequenceFluxPipeline if sequence else BatchFluxPipeline
     if base_type.__name__ == "Flux2KleinPipeline":
         from .pipeline_flux2_klein import BatchFlux2KleinPipeline, LegacyJointFlux2KleinPipeline
 

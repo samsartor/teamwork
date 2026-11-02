@@ -31,7 +31,7 @@ from teamwork.attn import LegacyJointSelection
 
 # Importing the pipeline modules registers their TEAMWORK_PROFILES. Guard the
 # Klein import so a half-finished Klein port doesn't block the Flux1 cases.
-import teamwork.pipeline_flux  # noqa: F401  registers FLUX / FLUX_PLUSATTN
+import teamwork.pipeline_flux  # noqa: F401  registers FLUX (sequence parity: test_flux_sequence_parity.py)
 try:
     import teamwork.pipeline_flux2_klein  # noqa: F401  registers FLUX2 / FLUX2_PLUSATTN
 except Exception as e:  # pragma: no cover - while the port is in progress
@@ -97,19 +97,6 @@ CASES = {
         teammates=["image.in", "albedo.out"],
         num_components=2,
         exact=True,
-    ),
-    "flux1-plusattn": dict(
-        repo="black-forest-labs/FLUX.1-Kontext-dev",
-        model_cls="FluxTransformer2DModel",
-        profile="FLUX_PLUSATTN",
-        n_axes=3,
-        in_channels=64,
-        joint_dim=4096,
-        pooled_dim=768,
-        guidance=3.5,
-        teammates=["image.out"],
-        num_components=1,  # single teammate => equals base self-attention
-        exact=False,
     ),
     "flux2-lora": dict(
         repo="black-forest-labs/FLUX.2-klein-4B",
