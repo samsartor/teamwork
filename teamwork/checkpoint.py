@@ -5,7 +5,8 @@ A checkpoint stores the adapter parameters of an adapted model under their modul
 paths (e.g. `transformer_blocks.0.attn.to_q.adapter.down`) plus the TeamworkConfig as
 metadata. Loading is strict: every adapter parameter of the adapted model must be in the
 checkpoint and every checkpoint key must be an adapter parameter. The one exemption is
-the legacy scalar `<module>.adapter` markers written for the joint-attention modules.
+the scalar `<module>.adapter` markers that pre-2.0 joint-attention checkpoints carry for
+their attention modules; they hold no weights and are ignored.
 """
 
 from pathlib import Path
@@ -23,16 +24,16 @@ ADAPTER_KEY = re.compile(r"(.+)\.adapter(\..+)?")
 
 
 def is_legacy_marker(key: str, tensor: torch.Tensor) -> bool:
-    """The scalar `<module>.adapter` placeholders of the joint-attention modules."""
+    """The scalar `<module>.adapter` placeholders in pre-2.0 joint-attention checkpoints."""
     return tensor.ndim == 0 and key.endswith(".adapter")
 
 
 def adapted_layers_in_state(state: dict[str, torch.Tensor]) -> set[str]:
     """Module paths that a checkpoint adapts (every adapted layer has a child "adapter")."""
     layers = set()
-    for key in state.keys():
+    for key, tensor in state.items():
         m = ADAPTER_KEY.fullmatch(key)
-        if m is not None:
+        if m is not None and not is_legacy_marker(key, tensor):
             layers.add(m.group(1))
     return layers
 
@@ -49,16 +50,12 @@ def load_adapter_state(
 
     Raises if an adapter parameter of `model` is missing from `state`, if `state` has a
     key that is not an adapter parameter of `model`, or if a shape differs. Legacy
-    scalar markers are exempt both ways: present ones are loaded into the module that
-    still has a marker, and others are ignored.
+    scalar markers in `state` are ignored.
     """
     expected = adapter_parameters(model)
-    missing = sorted(
-        k for k, p in expected.items() if k not in state and not is_legacy_marker(k, p)
-    )
-    unexpected = sorted(
-        k for k, t in state.items() if k not in expected and not is_legacy_marker(k, t)
-    )
+    state = {k: t for k, t in state.items() if not is_legacy_marker(k, t)}
+    missing = sorted(k for k in expected if k not in state)
+    unexpected = sorted(k for k in state if k not in expected)
     if missing or unexpected:
         raise KeyError(
             f"teamwork checkpoint does not match the adapted model: "
@@ -66,8 +63,6 @@ def load_adapter_state(
             f"{len(unexpected)} unexpected keys {unexpected[:8]}"
         )
     for key, tensor in state.items():
-        if key not in expected:
-            continue  # legacy marker of a module that no longer has one
         if expected[key].shape != tensor.shape:
             raise ValueError(
                 f"teamwork checkpoint key {key} has shape {tuple(tensor.shape)}, "

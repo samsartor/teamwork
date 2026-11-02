@@ -1,6 +1,5 @@
 """
-Token-ownership attention masks for sequence-axis teamwork, generalizing the joint-attention
-`_teammate_block_mask` to arbitrary `SequenceLayout`s.
+Token-ownership attention masks for sequence-axis teamwork over arbitrary `SequenceLayout`s.
 
 Rules shared by both `MaskRule`s:
 - Absent `(b, t)` slots are never attended to, and their queries attend to nothing (flex_attention

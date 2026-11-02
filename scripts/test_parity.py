@@ -1,63 +1,44 @@
 """
-Parity smoke test for teamwork adapters.
+Parity smoke test for batch-axis teamwork adapters.
 
 A core teamwork invariant: with every LoRA up-matrix (and bias) at zero, the
 adapted transformer must behave like the base transformer. This script checks
 that at the transformer level (no VAE / text encoder needed) by running a base
 diffusers transformer and its teamwork-adapted copy on identical synthetic
-inputs and comparing the outputs.
-
-Two flavors:
-  - lora-only profiles (FLUX / FLUX2): attention is untouched, so the LoRA adds
-    exactly zero and the outputs must match *bit for bit*.
-  - PLUSATTN profiles: attention is replaced by the flex_attention joint path.
-    With a single teammate and no attn gating it is mathematically the same as
-    the base self-attention, so outputs should match to attention-kernel
-    floating-point tolerance (flex_attention vs sdpa) -- this is what tells us
-    whether any residual difference is structural (a bug) or just the kernel.
+inputs. Attention is untouched, so the LoRA adds exactly zero and the outputs
+must match *bit for bit*. The sequence-layout parity checks against base editing
+are `test_edit_parity.py` (Klein) and `test_flux_sequence.py` (FLUX.1).
 
 Run from the repo root:
 
-    uv run python scripts/test_parity.py                # all available cases
+    uv run python scripts/test_parity.py                # all cases
     uv run python scripts/test_parity.py flux2-lora      # one case by name
 """
 
 import sys
 import torch
 
-from teamwork.config import TeamworkConfig, is_joint_attention_profile
-from teamwork.adapter import adapt, adapter_modules, TEAMWORK_PROFILES
-from teamwork.attn import LegacyJointSelection
+from teamwork.config import TeamworkConfig
+from teamwork.adapter import adapt, adapter_modules
+from teamwork.batch_linear import BatchSelection
+from teamwork.data import Components
 
-# Importing the pipeline modules registers their TEAMWORK_PROFILES. Guard the
-# Klein import so a half-finished Klein port doesn't block the Flux1 cases.
-import teamwork.pipeline_flux  # noqa: F401  registers FLUX (sequence parity: test_flux_sequence_parity.py)
-try:
-    import teamwork.pipeline_flux2_klein  # noqa: F401  registers FLUX2
-except Exception as e:  # pragma: no cover - while the port is in progress
-    print(f"(note: could not import pipeline_flux2_klein: {e!r})")
+# Importing the pipeline modules registers their TEAMWORK_PROFILES.
+import teamwork.pipeline_flux  # noqa: F401  registers FLUX
+import teamwork.pipeline_flux2_klein  # noqa: F401  registers FLUX2
 
 
 def single_batch_selection(teammate_indices, num_teammates, device):
-    """Build a selection for one logical batch element with the given teammates
-    (one component per teammate, all present, no attn gating). The legacy joint
-    selection also serves the batch adapters, which read only its batch fields."""
+    """A selection for one batch element with one output component per teammate."""
     n = len(teammate_indices)
-    batch_matrix = torch.ones(n, 1, dtype=torch.bool, device=device)
-    present_matrix = torch.zeros(1, num_teammates, dtype=torch.bool, device=device)
-    present_matrix[0, teammate_indices] = True
-    return LegacyJointSelection(
+    return BatchSelection.from_components(Components(
         teammate_indices=torch.tensor(teammate_indices, dtype=torch.int64, device=device),
+        batch_indices=torch.zeros(n, dtype=torch.int64, device=device),
         input_subindices=torch.empty(0, dtype=torch.int64, device=device),
         output_subindices=torch.arange(n, dtype=torch.int64, device=device),
-        batch_indices=torch.zeros(n, dtype=torch.int64, device=device),
-        batch_matrix=batch_matrix,
         num_teammates=num_teammates,
         batch_size=1,
-        present_matrix=present_matrix,
-        first_component_per_batch=torch.zeros(1, dtype=torch.int64, device=device),
-        attn_keep=None,
-    )
+    ))
 
 
 def make_ids(t_offset, h, w, txt_len, n_axes, device, dtype):
@@ -96,7 +77,6 @@ CASES = {
         guidance=3.5,
         teammates=["image.in", "albedo.out"],
         num_components=2,
-        exact=True,
     ),
     "flux2-lora": dict(
         repo="black-forest-labs/FLUX.2-klein-4B",
@@ -109,7 +89,6 @@ CASES = {
         guidance=None,
         teammates=["image.in", "albedo.out"],
         num_components=2,
-        exact=True,
     ),
 }
 
@@ -124,25 +103,19 @@ def load_transformer(case, device, dtype):
 
 def run_case(name, device, base_dtype, h=16, w=16, txt_len=32):
     case = CASES[name]
-    if case["profile"] not in TEAMWORK_PROFILES:
-        print(f"[SKIP] {name}: profile {case['profile']} not registered")
-        return None
 
-    # A case may pin fp32 for a tight gate; the env override forces fp32 globally.
+    # A case may pin fp32; the env override forces fp32 globally.
     dtype = torch.float32 if (case.get("dtype") == "fp32" or base_dtype == torch.float32) else base_dtype
 
     base = load_transformer(case, device, dtype)
     base.eval()
 
-    joint = is_joint_attention_profile(case["profile"])
     cfg = TeamworkConfig(
         teammates=case["teammates"],
         lora_rank=8,
         base_model=case["repo"],
         title="parity-test",
         profile=case["profile"],
-        layout="sequence" if joint else "batch",
-        text_teammate=case["teammates"][0] if joint else None,
     )
     adapted = adapt(base, cfg, device=device, dtype=dtype, requires_grad=False)
     adapted.eval()
@@ -161,9 +134,6 @@ def run_case(name, device, base_dtype, h=16, w=16, txt_len=32):
     )
     for m in adapter_modules(adapted).values():
         m.selection = sel
-        # Single (parallel) teamwork blocks need the text/image split point.
-        if hasattr(m, "text_seq_len"):
-            m.text_seq_len = txt_len
 
     B = case["num_components"]
     torch.manual_seed(0)
@@ -193,17 +163,9 @@ def run_case(name, device, base_dtype, h=16, w=16, txt_len=32):
 
     diff = (out_base.float() - out_adapted.float()).abs().max().item()
     scale = out_base.float().abs().max().item()
-    if case["exact"]:
-        tol = 0.0
-    else:
-        # fp32 isolates structural correctness (kernel-only ~1e-4); bf16 is a
-        # coarser check that still catches gross regressions.
-        rel = 1e-3 if dtype == torch.float32 else 6e-2
-        tol = rel * max(scale, 1.0)
-    ok = diff <= tol
+    ok = diff == 0.0
     status = "PASS" if ok else "FAIL"
-    kind = "exact" if case["exact"] else f"{str(dtype).split('.')[-1]}, tol={tol:.2e}"
-    print(f"[{status}] {name} ({case['profile']}, {kind}): "
+    print(f"[{status}] {name} ({case['profile']}, exact): "
           f"max-abs-diff={diff:.3e}, out-scale={scale:.3e}")
 
     del base, adapted, out_base, out_adapted, hidden, enc, kwargs
@@ -216,12 +178,12 @@ def run_case(name, device, base_dtype, h=16, w=16, txt_len=32):
 
 def main():
     if not torch.cuda.is_available():
-        print("teamwork attention requires CUDA; skipping.")
+        print("the parity cases need a CUDA GPU; skipping.")
         sys.exit(0)
     device = torch.device("cuda")
     # bf16 fits the big Flux1 (12B) on one GPU and keeps the adapter/model dtypes
     # matched so the lora-only round-trip cast is a no-op (stays bit-exact). Pass
-    # TEAMWORK_PARITY_FP32=1 for a tighter kernel-vs-structural read on small models.
+    # TEAMWORK_PARITY_FP32=1 to run in fp32.
     import os
     dtype = torch.float32 if os.environ.get("TEAMWORK_PARITY_FP32") == "1" else torch.bfloat16
 

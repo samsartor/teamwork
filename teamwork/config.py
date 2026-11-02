@@ -49,7 +49,7 @@ def default_teammate_image_ids(profile: str | None, layout: str, num_teammates: 
     """
     if layout != "sequence":
         return [0] * num_teammates
-    if profile in ("FLUX2", "FLUX2_PLUSATTN"):
+    if profile == "FLUX2":
         return list(range(0, 10 * num_teammates, 10))
     return list(range(num_teammates))
 
@@ -84,14 +84,14 @@ class TeamworkConfig:
             attention edges, or None for "all allowed". Diagonal must be ``1``. Combined
             multiplicatively with attention dropout to produce the runtime ``attn_keep``.
         teammate_image_ids: per-teammate RoPE image-id T-offset used to place each
-            teammate's image tokens in the joint-attention layout. One int per teammate.
+            teammate's image tokens in the sequence layout. One int per teammate.
             Defaults (resolved at construction and stored in the checkpoint) come from
             ``default_teammate_image_ids``; set explicitly to control which teammates act
             as generated (T=0) vs reference (T>0) images for models like klein.
         layout: how teammates are arranged for the model. ``"batch"``: each teammate is a row
             of the batch and teammates only communicate through LoRA. ``"sequence"``: the
             teammates of a batch element share one token stream and attend to each other.
-            The joint-attention (``*_PLUSATTN``) profiles are the sequence implementation.
+            Pre-2.0 joint-attention (``*_PLUSATTN``) checkpoints migrate to it.
         text_teammate: the roster name whose adapter applies to the text tokens in the sequence
             layout, or None to leave text at the base model.
         vlm_inputs: the ``.in`` teammates fed to the model's vision-language text encoder.

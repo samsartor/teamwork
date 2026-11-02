@@ -121,13 +121,6 @@ class BatchFluxPipeline(_FluxPipelineCommon):
             pipeline.transformer.enable_gradient_checkpointing()
         return pipeline
 
-    def make_selection(self, batch: TeamBuilder) -> BatchSelection:
-        return BatchSelection.from_components(batch.components_index())
-
-    def image_ids(self, lh: int, lw: int, device: torch.device, dtype: torch.dtype) -> Tensor:
-        """RoPE ids of the image tokens in each row: one image per row."""
-        return family_flux.latent_image_ids(lh, lw, device, dtype)
-
     def train_loss(
         self,
         batch: TeamBuilder,
@@ -141,7 +134,7 @@ class BatchFluxPipeline(_FluxPipelineCommon):
 
         with torch.no_grad():
             timestep_u = sample_timestep_u(self.timestep_weight, batch.batch_size)
-            sel = self.make_selection(batch)
+            sel = BatchSelection.from_components(batch.components_index())
             latents = batch.packed_encoded_images(
                 self.vae_encode, self.in_channels, 1 / self.vae_scale_factor
             )
@@ -155,7 +148,7 @@ class BatchFluxPipeline(_FluxPipelineCommon):
             guidance = torch.full_like(timesteps, 3.5) if family_flux.has_guidance(self.unwrapped_transformer) else None
 
             _, _, lh, lw = latents.shape
-            image_ids = self.image_ids(lh, lw, latents.device, latents.dtype)
+            image_ids = family_flux.latent_image_ids(lh, lw, latents.device, latents.dtype)
             prompt_embeds, pooled_prompt_embeds, text_ids = family_flux.encode_prompt(
                 self, prompt, latents.shape[0], latents.dtype,
             )
@@ -223,7 +216,7 @@ class BatchFluxPipeline(_FluxPipelineCommon):
             )
 
         # Initialize latents
-        sel = self.make_selection(batch)
+        sel = BatchSelection.from_components(batch.components_index())
         clean_latents = batch.packed_encoded_images(
             self.vae_encode, self.in_channels, 1 / self.vae_scale_factor
         )
@@ -238,7 +231,7 @@ class BatchFluxPipeline(_FluxPipelineCommon):
             latents = noise.to(device, self.dtype)
 
         _, _, lh, lw = latents.shape
-        image_ids = self.image_ids(lh, lw, latents.device, latents.dtype)
+        image_ids = family_flux.latent_image_ids(lh, lw, latents.device, latents.dtype)
         prompt_embeds, pooled_prompt_embeds, text_ids = family_flux.encode_prompt(
             self, prompt, latents.shape[0], latents.dtype,
         )
