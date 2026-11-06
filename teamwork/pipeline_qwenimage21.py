@@ -47,7 +47,7 @@ from .sequence_linear import (
     from_sequence,
     to_sequence,
 )
-from .sampling import sample_timestep_u, flow_match_noising
+from .sampling import sample_timestep_u, flow_match_noising, initial_noise
 from . import family_qwen21
 from .family_qwen21 import QwenPrompt
 
@@ -436,7 +436,8 @@ class QwenImage21TeamworkPipeline(TeamworkPipeline, QwenImage21Pipeline):
     def load_extra_metadata(self, metadata: dict[str, str]):
         pass
 
-    def vae_encode(self, x: Tensor) -> Tensor:
+    def vae_encode(self, x: Tensor, generator: torch.Generator | None = None) -> Tensor:
+        """Posterior means, so `generator` is unused (kept for the shared `vae_encode` signature)."""
         return family_qwen21.vae_encode(self.vae, x)
 
     def vae_decode(self, x: Tensor) -> Tensor:
@@ -584,9 +585,7 @@ class QwenImage21TeamworkPipeline(TeamworkPipeline, QwenImage21Pipeline):
         components = batch.components_index()
         clean_latents = batch.packed_encoded_images(self.vae_encode, self.in_channels, 1 / self.vae_scale_factor)
         if noise is None:
-            latents = torch.randn(
-                clean_latents.shape, device=clean_latents.device, dtype=clean_latents.dtype, generator=generator,
-            )
+            latents = initial_noise(clean_latents.shape, generator, clean_latents.device, clean_latents.dtype)
         else:
             assert noise.shape == clean_latents.shape, (tuple(noise.shape), tuple(clean_latents.shape))
             latents = noise.to(clean_latents.device, clean_latents.dtype)

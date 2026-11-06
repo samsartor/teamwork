@@ -8,10 +8,13 @@ import torch
 from torch import Tensor
 
 
-def vae_encode(vae: Any, x: Tensor) -> Tensor:
-    """Images in [-1, 1] to shifted and scaled latents (sampled from the posterior)."""
+def vae_encode(vae: Any, x: Tensor, generator: torch.Generator | None = None) -> Tensor:
+    """
+    Images in [-1, 1] to shifted and scaled latents, sampled from the posterior with `generator`
+    (or the global RNG if None).
+    """
     x = x.to(vae.device, vae.dtype)
-    x = vae.encode(x).latent_dist.sample()
+    x = vae.encode(x).latent_dist.sample(generator)
     x = (x - (vae.config.get("shift_factor", None) or 0)) * vae.config["scaling_factor"]
     return x
 

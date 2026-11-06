@@ -13,6 +13,7 @@ from .adapter import adapt, TEAMWORK_PROFILES, Adapt, set_selection
 from .checkpoint import save_adapters
 from .data import TeamBuilder, OutputImageType
 from .batch_linear import BatchSelection
+from .sampling import initial_noise
 
 
 class BatchSD2Pipeline(TeamworkPipeline, StableDiffusionPipeline):
@@ -63,9 +64,9 @@ class BatchSD2Pipeline(TeamworkPipeline, StableDiffusionPipeline):
     def load_extra_metadata(self, metadata: dict[str, str]):
         pass
 
-    def vae_encode(self, x: Tensor) -> Tensor:
+    def vae_encode(self, x: Tensor, generator: torch.Generator | None = None) -> Tensor:
         x = x.to(self.vae.device, self.vae.dtype)
-        x = self.vae.encode(x).latent_dist.sample()  # type: ignore
+        x = self.vae.encode(x).latent_dist.sample(generator)  # type: ignore
         x = x * self.vae.config.scaling_factor
         return x
 
@@ -207,15 +208,12 @@ class BatchSD2Pipeline(TeamworkPipeline, StableDiffusionPipeline):
         # Initialize latents
         sel = BatchSelection.from_components(batch.components_index())
         clean_latents = batch.packed_encoded_images(
-            self.vae_encode, self.unwrapped_unet.config["in_channels"], 1 / self.vae_scale_factor
+            lambda x: self.vae_encode(x, generator),
+            self.unwrapped_unet.config["in_channels"],
+            1 / self.vae_scale_factor,
         )
         if noise is None:
-            latents = torch.randn(
-                clean_latents.shape,
-                device=device,
-                dtype=self.dtype,
-                generator=generator,
-            )
+            latents = initial_noise(clean_latents.shape, generator, device, self.dtype)
         else:
             latents = noise.to(device, self.dtype)
         latents *= self.scheduler.init_noise_sigma

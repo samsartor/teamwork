@@ -1,6 +1,6 @@
 """
-Training helpers shared by the batch and sequence implementations: timestep sampling,
-flow-match noising, and loss weighting. Latents are in component layout `(count, C, h, w)`.
+Sampling helpers shared by the batch and sequence implementations: initial noise, timestep
+sampling, flow-match noising, and loss weighting. Latents are in component layout `(count, C, h, w)`.
 """
 
 from dataclasses import dataclass
@@ -13,6 +13,17 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchE
 from .data import Components
 
 TimestepWeight = Literal["unit", "sigma_sqrt", "logit_normal"]
+
+
+def initial_noise(
+    shape: torch.Size | tuple[int, ...], generator: torch.Generator | None, device: torch.device, dtype: torch.dtype,
+) -> Tensor:
+    """
+    Gaussian noise drawn on the generator's device, then moved to `device`. CUDA `randn` output for
+    a seed depends on the GPU's SM count, so pass a CPU generator to get the same noise on every GPU.
+    """
+    draw_device = device if generator is None else generator.device
+    return torch.randn(shape, generator=generator, device=draw_device, dtype=dtype).to(device)
 
 
 def sample_timestep_u(timestep_weight: str, batch_size: int) -> Tensor:

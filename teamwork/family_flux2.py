@@ -47,11 +47,14 @@ def latent_bn_stats(vae: Any, lh: int, lw: int, x: Tensor) -> tuple[Tensor, Tens
     return mean.to(x.device, x.dtype), std.to(x.device, x.dtype)
 
 
-def vae_encode(vae: Any, x: Tensor, version: str) -> Tensor:
-    """Images in [-1, 1] to latents: BN-normalized posterior means, or 1.0's raw samples."""
+def vae_encode(vae: Any, x: Tensor, version: str, generator: torch.Generator | None = None) -> Tensor:
+    """
+    Images in [-1, 1] to latents: BN-normalized posterior means, or 1.0's raw samples (drawn
+    from `generator`, or the global RNG if None).
+    """
     x = x.to(vae.device, vae.dtype)
     if legacy_latents(version):
-        return vae.encode(x).latent_dist.sample()
+        return vae.encode(x).latent_dist.sample(generator)
     x = vae.encode(x).latent_dist.mode()
     mean, std = latent_bn_stats(vae, x.shape[2], x.shape[3], x)
     return (x - mean) / std

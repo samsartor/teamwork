@@ -24,7 +24,7 @@ from .adapter import adapt, adapter_modules, TEAMWORK_PROFILES, Adapt, set_selec
 from .checkpoint import save_adapters
 from .data import Components, TeamBuilder, OutputImageType
 from .batch_linear import BatchSelection
-from .sampling import sample_timestep_u, flow_match_noising
+from .sampling import sample_timestep_u, flow_match_noising, initial_noise
 from .sequence_linear import (
     ModulationRows,
     SequenceLayout,
@@ -63,8 +63,8 @@ class _Flux2KleinTeamwork(TeamworkPipeline, Flux2KleinPipeline):
     def load_extra_metadata(self, metadata: dict[str, str]):
         pass
 
-    def vae_encode(self, x: Tensor) -> Tensor:
-        return family_flux2.vae_encode(self.vae, x, self.teamwork_config.version)
+    def vae_encode(self, x: Tensor, generator: torch.Generator | None = None) -> Tensor:
+        return family_flux2.vae_encode(self.vae, x, self.teamwork_config.version, generator)
 
     def vae_decode(self, x: Tensor) -> Tensor:
         return family_flux2.vae_decode(self.vae, x, self.teamwork_config.version)
@@ -204,15 +204,10 @@ class BatchFlux2KleinPipeline(_Flux2KleinTeamwork):
         # Initialize latents
         sel = BatchSelection.from_components(batch.components_index())
         clean_latents = batch.packed_encoded_images(
-            self.vae_encode, self.in_channels, 1 / self.vae_scale_factor
+            lambda x: self.vae_encode(x, generator), self.in_channels, 1 / self.vae_scale_factor
         )
         if noise is None:
-            latents = torch.randn(
-                clean_latents.shape,
-                device=device,
-                dtype=self.dtype,
-                generator=generator,
-            )
+            latents = initial_noise(clean_latents.shape, generator, device, self.dtype)
         else:
             latents = noise.to(device, self.dtype)
 
@@ -805,10 +800,10 @@ class SequenceFlux2KleinPipeline(_Flux2KleinTeamwork):
         components = batch.components_index()
         attn_keep = batch.attn_keep()
         clean_latents = batch.packed_encoded_images(
-            self.vae_encode, self.in_channels, 1 / self.vae_scale_factor
+            lambda x: self.vae_encode(x, generator), self.in_channels, 1 / self.vae_scale_factor
         )
         if noise is None:
-            latents = torch.randn(clean_latents.shape, device=device, dtype=self.dtype, generator=generator)
+            latents = initial_noise(clean_latents.shape, generator, device, self.dtype)
         else:
             latents = noise.to(device, self.dtype)
         assert latents.shape == clean_latents.shape, f"noise {tuple(latents.shape)}, latents {tuple(clean_latents.shape)}"

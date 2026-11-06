@@ -173,7 +173,7 @@ def pipeline(
     pipe.set_progress_bar_config(disable=True)
     sampled_encode = pipe.vae_encode
 
-    def mode_encode(x: Tensor) -> Tensor:
+    def mode_encode(x: Tensor, generator: torch.Generator | None = None) -> Tensor:
         latents = pipe.vae.encode(x.to(pipe.vae.device, pipe.vae.dtype)).latent_dist.mode()
         return (latents - pipe.vae.config["shift_factor"]) * pipe.vae.config["scaling_factor"]
 
